@@ -63,6 +63,11 @@ async function api(path, body) {
   return data;
 }
 
+function ssLink(ss, host) {
+  const user = btoa(`${ss.method}:${ss.password}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `ss://${user}@${host.includes(":") ? `[${host}]` : host}:${ss.port}#VPNGATE`;
+}
+
 function nodeCard(n, live) {
   if (!n) return '<span class="muted">无</span>';
   return `<div class="big">${esc(n.ip)} <span class="tag">${n.proto.toUpperCase()}</span> <span class="tag">${KIND[n.kind]||n.kind}</span></div>
@@ -90,6 +95,7 @@ function render(s) {
   const socks = `socks5h://${auth}${host}:${s.proxy.port}`, http = `http://${auth}${host}:${s.proxy.port}`;
   $("proxy").innerHTML = `<div class="kv"><span>SOCKS5</span><code class="copy" title="点击复制">${esc(socks)}</code>
   <span>HTTP</span><code class="copy" title="点击复制">${esc(http)}</code>
+  ${s.ss ? `<span>SS (UDP)</span><code class="copy" title="点击复制">${esc(ssLink(s.ss, location.hostname))}</code>` : ""}
   <span>连接</span><span>${s.proxy.active} 活动 / ${s.proxy.total} 累计</span>
   <span>流量</span><span>↑ ${bytes(s.proxy.bytes_up)} ↓ ${bytes(s.proxy.bytes_down)}</span></div>
   <p class="sub">经专线中转时，把主机名换成专线入口地址和端口。</p>`;

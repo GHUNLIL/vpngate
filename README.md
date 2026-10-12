@@ -1,6 +1,6 @@
 # VPNGATE
 
-日本家宽出口网关：在日本 VPS 上自动挑选延迟最低、丢包最少的 VPNGate **日本家宽**节点，对外提供 HTTP / HTTPS / SOCKS5 代理（同一端口）。配合沪日专线，得到“专线低延迟 + 日本住宅 IP 出口”。
+日本家宽出口网关：在日本 VPS 上自动挑选延迟最低、丢包最少的 VPNGate **日本家宽**节点，对外提供 HTTP / HTTPS / SOCKS5 代理（同一端口），以及加密、支持 UDP 的 Shadowsocks 入口。配合沪日专线，得到“专线低延迟 + 日本住宅 IP 出口”。
 
 - **单个静态二进制**（约 7 MB，Go 标准库，零依赖），系统只需 `openvpn` 和 `iproute2`
 - **零拷贝转发**：握手后两端都是 TCP 套接字，Linux 上走 `splice(2)`，数据不经过用户态
@@ -34,7 +34,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/GHUNLIL/vpngate/main/install
 | 项目 | 默认值 |
 | --- | --- |
 | 管理后台 | `http://VPS:54345/`（HTTP Basic 认证，连续失败 10 次锁定 10 分钟） |
-| 代理 | `VPS:7928`，HTTP / HTTPS CONNECT / SOCKS5 共用，需要账号密码 |
+| 代理 | `VPS:7928`，HTTP / HTTPS CONNECT / SOCKS5 共用，需要账号密码，仅 TCP |
+| Shadowsocks | `VPS:7929`（TCP + UDP），`aes-128-gcm`，加密，**支持 UDP**（游戏、语音、QUIC） |
+
+需要 UDP 或者想让客户端到服务器这段加密，就用 Shadowsocks。`vpngate info` 会打印 `ss://` 链接和 Clash 配置，后台页面也能直接复制：
+
+```yaml
+proxies:
+  - {name: 日本家宽, type: ss, server: VPS地址, port: 7929, cipher: aes-128-gcm, password: "密码", udp: true}
+```
+
+UDP 同样从日本家宽出口出去。主节点故障切换或定时重选后，正在进行的 UDP 会话会自动迁到新的隧道上。
 
 **延迟最低的用法**：客户端优先用 **HTTP 代理**（HTTPS 走 CONNECT）。带账号密码的 SOCKS5 在发出数据前要经专线来回 3 次，HTTP CONNECT 只要 1 次。如果设置了 `PROXY_ALLOW` 白名单，还可以把 `PROXY_USER` 和 `PROXY_PASS` 留空，免去认证。
 
@@ -68,6 +78,7 @@ vpngate uninstall  卸载
 | `WEB_PORT` | `54345` | 管理后台端口 |
 | `PROXY_PORT` | `7928` | 代理端口 |
 | `PROXY_ALLOW` | 空 | 允许访问代理的来源 IP/CIDR，逗号分隔 |
+| `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | `7929` / 随机 / `aes-128-gcm` | Shadowsocks 入口，密码留空则关闭；可选 `aes-256-gcm` |
 | `FAST_CONNECT` | `1` | 先回复“连接成功”再连上游，每个新连接省一次隧道往返 |
 | `COUNTRIES` | `JP` | 节点国家 |
 | `RESIDENTIAL_ONLY` | `1` | 只用家宽节点（没有可用家宽时临时放宽） |

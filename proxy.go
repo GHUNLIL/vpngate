@@ -66,21 +66,22 @@ func (p *Proxy) checkAuth(user, pass string) bool {
 }
 
 func (p *Proxy) allowed(addr net.Addr) bool {
-	if len(p.Allow) == 0 {
+	tcp, ok := addr.(*net.TCPAddr)
+	return ok && sourceAllowed(p.Allow, tcp.IP)
+}
+
+// sourceAllowed applies the PROXY_ALLOW list (empty = everyone); loopback is always allowed.
+func sourceAllowed(allow []*net.IPNet, ip net.IP) bool {
+	if len(allow) == 0 {
 		return true
 	}
-	tcp, ok := addr.(*net.TCPAddr)
-	if !ok {
-		return false
-	}
-	ip := tcp.IP
 	if v4 := ip.To4(); v4 != nil {
 		ip = v4
 	}
 	if ip.IsLoopback() {
 		return true
 	}
-	for _, n := range p.Allow {
+	for _, n := range allow {
 		if n.Contains(ip) {
 			return true
 		}

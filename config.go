@@ -27,6 +27,11 @@ type Config struct {
 	ProxyMaxConns int
 	FastConnect   bool
 
+	// Shadowsocks: encrypted TCP + UDP entry (disabled when SS_PASSWORD is empty)
+	SSPort     int
+	SSPassword string
+	SSMethod   string
+
 	Sources          []string
 	Countries        []string
 	ResidentialOnly  bool
@@ -59,6 +64,9 @@ func LoadConfig() (*Config, error) {
 		ProxyPass:        str("PROXY_PASS", ""),
 		ProxyMaxConns:    num("PROXY_MAX_CONNS", 8192, 16, 1<<20),
 		FastConnect:      boolEnv("FAST_CONNECT", true),
+		SSPort:           num("SS_PORT", 7929, 1, 65535),
+		SSPassword:       str("SS_PASSWORD", ""),
+		SSMethod:         str("SS_METHOD", "aes-128-gcm"),
 		Sources:          list("SOURCES", "https://www.vpngate.net/api/iphone/,http://www.vpngate.net/api/iphone/"),
 		Countries:        list("COUNTRIES", "JP"),
 		ResidentialOnly:  boolEnv("RESIDENTIAL_ONLY", true),
@@ -94,8 +102,8 @@ func LoadConfig() (*Config, error) {
 	if c.WebPass == "" {
 		return nil, fmt.Errorf("WEB_PASS 未设置，拒绝以空密码启动管理后台")
 	}
-	if c.WebPort == c.ProxyPort {
-		return nil, fmt.Errorf("PROXY_PORT 与 WEB_PORT 不能相同")
+	if c.WebPort == c.ProxyPort || c.SSPassword != "" && (c.SSPort == c.WebPort || c.SSPort == c.ProxyPort) {
+		return nil, fmt.Errorf("WEB_PORT、PROXY_PORT、SS_PORT 不能相同")
 	}
 	if net.ParseIP(c.ProbeTarget).To4() == nil {
 		return nil, fmt.Errorf("PROBE_TARGET 必须是 IPv4 地址")

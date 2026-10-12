@@ -147,7 +147,23 @@ func run() error {
 	defer p.Close()
 	go func() { _ = p.Serve() }()
 
-	web := NewWebUI(cfg, m, p, ring)
+	var ss *SSServer
+	if cfg.SSPassword != "" {
+		c, err := newSSCipher(cfg.SSMethod, cfg.SSPassword)
+		if err != nil {
+			return err
+		}
+		ss = &SSServer{Addr: net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.SSPort)), Cipher: c,
+			Allow: func(ip net.IP) bool { return sourceAllowed(cfg.ProxyAllow, ip) },
+			Dial:  TunnelDialer(m.res, m.Route), Res: m.res, Route: m.Route}
+		if err := ss.Listen(); err != nil {
+			return err
+		}
+		defer ss.Close()
+		go ss.Serve()
+	}
+
+	web := NewWebUI(cfg, m, p, ss, ring)
 	webAddr := net.JoinHostPort(cfg.WebHost, strconv.Itoa(cfg.WebPort))
 	errc := make(chan error, 1)
 	go func() { errc <- web.Serve(ctx, webAddr) }()
@@ -191,6 +207,7 @@ func install() error {
 		env := setEnv(envTemplate, "WEB_PASS", randomString(20))
 		env = setEnv(env, "PROXY_USER", "u"+randomString(7))
 		env = setEnv(env, "PROXY_PASS", randomString(20))
+		env = setEnv(env, "SS_PASSWORD", randomString(24))
 		if err := os.WriteFile(envPath, []byte(env), 0o600); err != nil {
 			return err
 		}
@@ -253,6 +270,19 @@ func info() error {
   服务状态  %s
 `, ip, env["WEB_PORT"], env["WEB_USER"], env["WEB_PASS"], user, pass, ip, port, user, pass, ip, port, ip, port,
 		strings.TrimSpace(string(state)))
+	if sp := env["SS_PASSWORD"]; sp != "" {
+		method := env["SS_METHOD"]
+		if method == "" {
+			method = "aes-128-gcm"
+		}
+		ssPort, _ := strconv.Atoi(env["SS_PORT"])
+		fmt.Printf(`
+  Shadowsocks (加密, 支持 UDP)
+  链接     %s
+  Clash:
+    - {name: 日本家宽, type: ss, server: %s, port: %d, cipher: %s, password: "%s", udp: true}
+`, SSURI(method, sp, ip, ssPort, "VPNGATE"), ip, ssPort, method, sp)
+	}
 	return nil
 }
 
@@ -263,6 +293,7 @@ func passwd() error {
 	}
 	env := setEnv(string(data), "WEB_PASS", randomString(20))
 	env = setEnv(env, "PROXY_PASS", randomString(20))
+	env = setEnv(env, "SS_PASSWORD", randomString(24))
 	if err := os.WriteFile(envPath, []byte(env), 0o600); err != nil {
 		return err
 	}
