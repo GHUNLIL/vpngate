@@ -25,7 +25,7 @@ import (
 // Set at build time: -ldflags "-X main.version=1.0.0 -X main.repo=owner/vpngate"
 var (
 	version = "dev"
-	repo    = "YOUR_GITHUB_USER/vpngate"
+	repo    = "GHUNLIL/vpngate"
 )
 
 const (

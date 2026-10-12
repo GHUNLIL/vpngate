@@ -1,5 +1,5 @@
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
-REPO    ?= YOUR_GITHUB_USER/vpngate
+REPO    ?= GHUNLIL/vpngate
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.repo=$(REPO)
 export CGO_ENABLED=0
 

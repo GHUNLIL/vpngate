@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # VPNGATE installer (systemd Linux, root):
-#   bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USER/vpngate/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/GHUNLIL/vpngate/main/install.sh)
 # Or offline: put the vpngate binary next to this script and run `bash install.sh`.
 set -euo pipefail
 
-REPO="${VPNGATE_REPO:-YOUR_GITHUB_USER/vpngate}"
+REPO="${VPNGATE_REPO:-GHUNLIL/vpngate}"
 
 die() { printf '\033[31m错误: %s\033[0m\n' "$*"; exit 1; }
 step() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -33,13 +33,12 @@ else
     die "不支持的发行版 (需要 apt / dnf / yum)"
 fi
 
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd || true)"
 BIN=""
 for f in "$SRC_DIR/vpngate-linux-$ARCH" "$SRC_DIR/dist/vpngate-linux-$ARCH" "$SRC_DIR/vpngate"; do
     [ -f "$f" ] && [ "$f" != /usr/local/bin/vpngate ] && BIN="$f" && break
 done
 if [ -z "$BIN" ]; then
-    [[ "$REPO" == YOUR_GITHUB_USER/* ]] && die "请把 install.sh 里的 REPO 改成你的 GitHub 仓库，或把二进制放在脚本旁边"
     step "下载 vpngate-linux-$ARCH"
     BIN=$(mktemp)
     trap 'rm -f "$BIN"' EXIT

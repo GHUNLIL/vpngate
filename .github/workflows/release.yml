@@ -15,7 +15,6 @@ jobs:
           go-version-file: go.mod
       - run: make test
       - run: make release VERSION=${GITHUB_REF_NAME#v} REPO=${{ github.repository }}
-      - run: sed -i "s#YOUR_GITHUB_USER/vpngate#${{ github.repository }}#g" dist/install.sh
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

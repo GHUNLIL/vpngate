@@ -1,3 +1,3 @@
-module github.com/YOUR_GITHUB_USER/vpngate
+module github.com/GHUNLIL/vpngate
 
 go 1.23
