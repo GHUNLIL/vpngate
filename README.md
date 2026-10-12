@@ -74,6 +74,9 @@ vpngate uninstall  卸载
 | `WEB_PORT` | `54345` | 管理后台端口 |
 | `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | `7929` / 随机 / `aes-128-gcm` | Shadowsocks 入口；可选 `aes-256-gcm` |
 | `SS_ALLOW` | 空 | 允许连接的来源 IP/CIDR，逗号分隔；留空不限制 |
+| `WEB_ALLOW` | 空 | 允许访问管理后台的 IP/CIDR；不在列表里的来源直接返回 403，连登录框都看不到 |
+| `NOTIFY_WEBHOOK` | 空 | 出口 IP 变化、无可用节点、恢复时 POST JSON 到此地址 |
+| `TG_BOT_TOKEN` / `TG_CHAT_ID` | 空 | 同样的事件发到 Telegram |
 | `COUNTRIES` | `JP` | 节点国家 |
 | `TRANSPORT` | `udp` | 隧道协议：`udp` 只用原生 UDP（没有可用 UDP 节点时才退回 TCP），`tcp`，或 `auto` 两者一起比 |
 | `RESIDENTIAL_ONLY` | `1` | 只用家宽节点（没有可用家宽时临时放宽） |
@@ -86,6 +89,18 @@ vpngate uninstall  卸载
 | `FAIL_LOSS_PCT` | `5` | 主节点最近 30 秒丢包超过此值、且备用明显更干净时立即切换 |
 | `DNS_SERVERS` | `1.1.1.1,8.8.8.8` | 通过隧道查询的 DNS |
 | `SOURCES` | VPNGate 官方 API | 节点列表源，可追加镜像 |
+
+## 通知
+
+出口 IP 变化（90 分钟重选、故障切换、手动切换、重启后没能连回原节点）、完全没有可用节点、恢复时，会发通知到 Webhook 和/或 Telegram。Webhook 收到的 JSON：
+
+```json
+{"event": "exit_ip_changed", "old_ip": "60.149.136.130", "new_ip": "58.87.159.9",
+ "reason": "实时丢包 5.3%，切到备用 (丢包 0.0%)", "node": "58.87.159.9 Sony Network Communications Inc UDP",
+ "text": "出口 IP 变更 60.149.136.130 → 58.87.159.9，原因: ...", "time": 1791790423}
+```
+
+`event` 取值：`exit_ip_changed`、`no_node`（服务中断）、`recovered`（恢复，带新 IP）。发送是异步的，失败只记日志，不影响切换。
 
 ## 选点规则
 

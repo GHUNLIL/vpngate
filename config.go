@@ -14,10 +14,11 @@ type Config struct {
 	DataDir string
 	OpenVPN string
 
-	WebHost string
-	WebPort int
-	WebUser string
-	WebPass string
+	WebHost  string
+	WebPort  int
+	WebUser  string
+	WebPass  string
+	WebAllow []*net.IPNet // allowed admin sources; empty = everyone
 
 	// Shadowsocks: the single client entry, encrypted, TCP + UDP on one port
 	SSHost     string
@@ -44,6 +45,10 @@ type Config struct {
 	FailLossPct     float64
 
 	DNSServers []string
+
+	NotifyWebhook string // POST JSON on exit IP change / outage / recovery
+	TGBotToken    string
+	TGChatID      string
 }
 
 func LoadConfig() (*Config, error) {
@@ -74,23 +79,19 @@ func LoadConfig() (*Config, error) {
 		MonitorInterval:  time.Duration(num("MONITOR_INTERVAL", 2, 1, 60)) * time.Second,
 		FailLossPct:      float64(num("FAIL_LOSS_PCT", 5, 1, 100)),
 		DNSServers:       list("DNS_SERVERS", "1.1.1.1,8.8.8.8"),
+		NotifyWebhook:    str("NOTIFY_WEBHOOK", ""),
+		TGBotToken:       str("TG_BOT_TOKEN", ""),
+		TGChatID:         str("TG_CHAT_ID", ""),
 	}
 	for i, cc := range c.Countries {
 		c.Countries[i] = strings.ToUpper(cc)
 	}
-	for _, item := range list("SS_ALLOW", "") {
-		if !strings.Contains(item, "/") {
-			if strings.Contains(item, ":") {
-				item += "/128"
-			} else {
-				item += "/32"
-			}
-		}
-		_, network, err := net.ParseCIDR(item)
-		if err != nil {
-			return nil, fmt.Errorf("SS_ALLOW 格式错误 %q: %v", item, err)
-		}
-		c.SSAllow = append(c.SSAllow, network)
+	var err error
+	if c.SSAllow, err = cidrList("SS_ALLOW"); err != nil {
+		return nil, err
+	}
+	if c.WebAllow, err = cidrList("WEB_ALLOW"); err != nil {
+		return nil, err
 	}
 	if c.WebPass == "" {
 		return nil, fmt.Errorf("WEB_PASS 未设置，拒绝以空密码启动管理后台")
@@ -111,6 +112,26 @@ func LoadConfig() (*Config, error) {
 }
 
 func (c *Config) RunDir() string { return c.DataDir + "/run" }
+
+// cidrList parses a comma-separated list of IPs / CIDRs from the environment.
+func cidrList(name string) ([]*net.IPNet, error) {
+	var out []*net.IPNet
+	for _, item := range list(name, "") {
+		if !strings.Contains(item, "/") {
+			if strings.Contains(item, ":") {
+				item += "/128"
+			} else {
+				item += "/32"
+			}
+		}
+		_, network, err := net.ParseCIDR(item)
+		if err != nil {
+			return nil, fmt.Errorf("%s 格式错误 %q: %v", name, item, err)
+		}
+		out = append(out, network)
+	}
+	return out, nil
+}
 
 func str(name, def string) string {
 	if v, ok := os.LookupEnv(name); ok {

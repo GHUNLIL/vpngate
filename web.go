@@ -88,6 +88,10 @@ func (w *WebUI) guard(next http.Handler) http.Handler {
 		h.Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'")
 
 		peer, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if !sourceAllowed(w.cfg.WebAllow, net.ParseIP(peer)) {
+			http.Error(rw, "forbidden", http.StatusForbidden) // not on WEB_ALLOW: no login page either
+			return
+		}
 		if w.lockedOut(peer) {
 			http.Error(rw, "登录失败次数过多，请 10 分钟后再试", http.StatusTooManyRequests)
 			return

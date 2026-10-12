@@ -112,3 +112,62 @@ func TestPoolResidentialFallback(t *testing.T) {
 		t.Errorf("want fallback to all nodes, got %d", len(pool))
 	}
 }
+
+func TestWebAllowList(t *testing.T) {
+	t.Setenv("WEB_ALLOW", "203.0.113.0/24")
+	w, _ := newWeb(t)
+	h := w.Handler()
+	if rec := call(h, "GET", "/", "admin", "test", false, ""); rec.Code != 403 {
+		t.Errorf("source outside WEB_ALLOW: want 403, got %d", rec.Code)
+	}
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "203.0.113.9:5555"
+	req.SetBasicAuth("admin", "test")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("allowed source: want 200, got %d", rec.Code)
+	}
+}
+
+func TestExitIPNotifications(t *testing.T) {
+	got := make(chan Event, 4)
+	hook := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		var e Event
+		_ = json.NewDecoder(r.Body).Decode(&e)
+		got <- e
+	}))
+	defer hook.Close()
+	t.Setenv("NOTIFY_WEBHOOK", hook.URL)
+	_, m := newWeb(t)
+	tun := func(ip string) *Tunnel {
+		return &Tunnel{Node: &Node{ID: ip, IP: ip, ExitIP: ip, ISP: "ISP", Proto: "udp"}, exited: make(chan struct{})}
+	}
+	next := func() Event {
+		select {
+		case e := <-got:
+			return e
+		case <-time.After(3 * time.Second):
+			t.Fatal("no notification")
+			return Event{}
+		}
+	}
+	m.mu.Lock()
+	m.setActive(tun("1.1.1.1"), "start") // first IP: nothing to announce
+	m.standby = tun("2.2.2.2")
+	m.failover("丢包")
+	m.mu.Unlock()
+	if e := next(); e.Event != "exit_ip_changed" || e.OldIP != "1.1.1.1" || e.NewIP != "2.2.2.2" || e.Reason != "丢包" {
+		t.Errorf("change event %+v", e)
+	}
+	m.mu.Lock()
+	m.failover("断线") // no standby left -> outage
+	m.setActive(tun("3.3.3.3"), "选出新节点")
+	m.mu.Unlock()
+	if e := next(); e.Event != "no_node" {
+		t.Errorf("want outage event, got %+v", e)
+	}
+	if e := next(); e.Event != "recovered" || e.NewIP != "3.3.3.3" {
+		t.Errorf("want recovery event, got %+v", e)
+	}
+}

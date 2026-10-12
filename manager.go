@@ -54,6 +54,9 @@ type Manager struct {
 	standby     *Tunnel
 	lockedID    string // user-pinned node: keep this exit IP
 	closing     bool
+	exitIP      string // last announced exit IP, for change notifications
+	down        bool   // no usable node; announced once until recovery
+	notify      *Notifier
 	activeSince time.Time
 	status      string
 	lastRefresh int64
@@ -65,6 +68,7 @@ type Manager struct {
 
 func NewManager(cfg *Config) *Manager {
 	m := &Manager{cfg: cfg, res: NewResolver(cfg.DNSServers), nodes: map[string]*Node{},
+		notify: &Notifier{WebhookURL: cfg.NotifyWebhook, TGToken: cfg.TGBotToken, TGChatID: cfg.TGChatID},
 		status: "启动中", wake: make(chan struct{}, 1), auth: filepath.Join(cfg.DataDir, "auth.txt")}
 	for i := 0; i < maxSlots; i++ {
 		m.slots = append(m.slots, i)
@@ -104,17 +108,19 @@ func (m *Manager) Start(ctx context.Context) error {
 		LockedID    string `json:"locked_id"`
 		Last        *Node  `json:"last"`
 		ActiveSince int64  `json:"active_since"`
+		ExitIP      string `json:"exit_ip"`
 	}
 	if data, err := os.ReadFile(m.statePath()); err == nil {
 		_ = json.Unmarshal(data, &state)
 	}
 	m.lockedID = state.LockedID
+	m.exitIP = state.ExitIP
 	if state.Last != nil && state.Last.Config != "" && m.transportOK(state.Last) {
 		m.nodes[state.Last.ID] = state.Last
 		log.Printf("尝试恢复上次使用的节点 %s (保持出口 IP 不变)", state.Last.IP)
 		if t := m.evaluate(ctx, state.Last); t != nil {
 			m.mu.Lock()
-			m.setActive(t)
+			m.setActive(t, "重启后恢复")
 			if state.ActiveSince > 0 { // a restart does not reset the hold period
 				m.activeSince = time.Unix(state.ActiveSince, 0)
 				m.saveState()
@@ -427,7 +433,7 @@ func (m *Manager) ensure(ctx context.Context) {
 		if m.active != nil {
 			m.release(m.active)
 		}
-		m.setActive(tunnels[0])
+		m.setActive(tunnels[0], "选出新节点")
 		tunnels = tunnels[1:]
 	}
 	if m.cfg.Standby && (m.standby == nil || !m.standby.Alive()) && len(tunnels) > 0 {
@@ -445,6 +451,7 @@ func (m *Manager) ensure(ctx context.Context) {
 		m.status = "运行中"
 	} else {
 		m.status = "没有可用节点，1 分钟后重试"
+		m.markDown("没有可用节点")
 	}
 	m.mu.Unlock()
 }
@@ -523,7 +530,7 @@ func (m *Manager) reselect(ctx context.Context, fresh []*Tunnel) {
 		m.saveState()
 	} else {
 		log.Printf("定时重选: 切换到更优节点")
-		m.setActive(best)
+		m.setActive(best, fmt.Sprintf("%d 分钟定时重选", int(m.cfg.Hold.Minutes())))
 	}
 	if second != nil {
 		log.Printf("备用节点: %s", describe(second.Node))
@@ -760,7 +767,7 @@ func (m *Manager) tcpProbe(ctx context.Context, dev string, count int) PingStats
 
 // ---------------------------------------------------------------- switching (caller holds m.mu)
 
-func (m *Manager) setActive(t *Tunnel) {
+func (m *Manager) setActive(t *Tunnel, reason string) {
 	if m.closing {
 		m.release(t)
 		return
@@ -768,13 +775,44 @@ func (m *Manager) setActive(t *Tunnel) {
 	m.active = t
 	m.activeSince = time.Now()
 	log.Printf("当前节点: %s", describe(t.Node))
+	m.announce(t.Node, reason)
 	m.saveState()
+}
+
+// announce notifies when the exit IP changes or service comes back (caller holds m.mu).
+func (m *Manager) announce(n *Node, reason string) {
+	ip := n.ExitIP
+	if ip == "" {
+		ip = n.IP
+	}
+	old := m.exitIP
+	m.exitIP = ip
+	node := fmt.Sprintf("%s %s %s", n.IP, n.ISP, strings.ToUpper(n.Proto))
+	switch {
+	case m.down:
+		m.down = false
+		m.notify.Send(Event{Event: "recovered", OldIP: old, NewIP: ip, Reason: reason, Node: node,
+			Text: fmt.Sprintf("已恢复，出口 IP %s (%s)", ip, n.ISP)})
+	case old != "" && old != ip:
+		m.notify.Send(Event{Event: "exit_ip_changed", OldIP: old, NewIP: ip, Reason: reason, Node: node,
+			Text: fmt.Sprintf("出口 IP 变更 %s → %s，原因: %s (%s)", old, ip, reason, n.ISP)})
+	}
+}
+
+// markDown announces an outage once (caller holds m.mu).
+func (m *Manager) markDown(reason string) {
+	if m.down || m.closing {
+		return
+	}
+	m.down = true
+	log.Printf("服务中断: %s", reason)
+	m.notify.Send(Event{Event: "no_node", OldIP: m.exitIP, Reason: reason, Text: "服务中断: " + reason})
 }
 
 // promote is make-before-break: the old active becomes the standby so open connections survive.
 func (m *Manager) promote(t *Tunnel, reason string) {
 	old := m.active
-	m.setActive(t)
+	m.setActive(t, reason)
 	log.Printf("切换原因: %s", reason)
 	if old != nil && old.Alive() && m.cfg.Standby {
 		if m.standby != nil {
@@ -798,8 +836,10 @@ func (m *Manager) failover(reason string) {
 	if m.standby != nil && m.standby.Alive() {
 		sb := m.standby
 		m.standby = nil
-		m.setActive(sb)
+		m.setActive(sb, reason)
 		log.Printf("已切换到备用节点 (无需重新握手)")
+	} else {
+		m.markDown(reason + "，且没有可用的备用节点")
 	}
 	m.release(old)
 	m.RequestRefresh()
@@ -1050,6 +1090,7 @@ func (m *Manager) saveState() {
 	if m.active != nil {
 		state["last"] = m.active.Node
 		state["active_since"] = m.activeSince.Unix()
+		state["exit_ip"] = m.exitIP
 	}
 	data, err := json.Marshal(state)
 	if err != nil {
