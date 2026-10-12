@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VPNGATE</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1c2330;--muted:#6b7585;--line:#e4e7ec;--accent:#2563eb;--ok:#15803d;--warn:#b45309;--bad:#b91c1c}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1318;--card:#171c23;--fg:#e6e9ee;--muted:#8b95a5;--line:#262d37;--accent:#60a5fa;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--card)}
+h1{font-size:17px;margin:0;letter-spacing:.5px}.sub{color:var(--muted);font-size:12px}.grow{flex:1}
+main{max-width:1200px;margin:0 auto;padding:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card h2{font-size:12px;font-weight:600;color:var(--muted);margin:0 0 8px;text-transform:uppercase;letter-spacing:.6px}
+.big{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:13px}.kv span:nth-child(odd){color:var(--muted)}
+.metrics{display:flex;gap:18px;margin:6px 0 10px}.metrics div{display:flex;flex-direction:column}.metrics small{color:var(--muted);font-size:11px}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:5px 12px;cursor:pointer}
+button:hover{border-color:var(--accent)}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button:disabled{opacity:.5;cursor:wait}
+code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px;word-break:break-all}
+.copy{cursor:pointer}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.muted{color:var(--muted)}
+.table{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{color:var(--muted);font-weight:500;font-size:12px}
+tr.active td{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:9px;border:1px solid var(--line)}
+.err{max-width:220px;overflow:hidden;text-overflow:ellipsis;color:var(--muted)}
+pre{margin:0;max-height:260px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<header><h1>VPNGATE</h1><span class="sub" id="ver"></span><span class="grow"></span>
+<span id="status" class="sub"></span>
+<button id="lockBtn"></button><button id="refreshBtn">重新测试</button></header>
+<main>
+<div class="grid">
+  <div class="card"><h2>当前节点</h2><div id="active" class="muted">连接中…</div></div>
+  <div class="card"><h2>备用节点（热备，故障时秒切）</h2><div id="standby" class="muted">无</div></div>
+  <div class="card"><h2>代理</h2><div id="proxy"></div></div>
+</div>
+<div class="card table" style="margin-bottom:12px"><h2>节点（评分越低越好）</h2>
+<table><thead><tr><th>IP</th><th>类型</th><th>运营商</th><th>城市</th><th>协议</th><th>直连</th><th>隧道延迟</th><th>抖动</th><th>丢包</th><th>速度</th><th>评分</th><th>状态</th><th></th></tr></thead>
+<tbody id="nodes"></tbody></table></div>
+<div class="card"><h2>日志</h2><pre id="logs"></pre></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ms = v => v == null ? "–" : v.toFixed(v < 10 ? 1 : 0) + " ms";
+const pct = v => v == null ? "–" : v.toFixed(0) + "%";
+const mbps = v => v ? v.toFixed(0) + " Mbps" : "–";
+const bytes = n => { const u = ["B","KB","MB","GB","TB"]; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + " " + u[i]; };
+const since = t => { if (!t) return "–"; let s = Math.floor(Date.now()/1000 - t); const h = Math.floor(s/3600), m = Math.floor(s%3600/60); return h ? `${h} 小时 ${m} 分` : `${m} 分`; };
+const KIND = {residential:"家宽", mobile:"移动", hosting:"机房", academic:"学术", unknown:"未知"};
+const lossCls = v => v == null ? "" : v < 1 ? "ok" : v < 5 ? "warn" : "bad";
+let state = null;
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json","X-Requested-With":"vpngate"}, body:JSON.stringify(body)});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data.ok === false) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+function nodeCard(n, live) {
+  if (!n) return '<span class="muted">无</span>';
+  return `<div class="big">${esc(n.ip)} <span class="tag">${n.proto.toUpperCase()}</span> <span class="tag">${KIND[n.kind]||n.kind}</span></div>
+  <div class="metrics">
+    <div><small>延迟</small><b>${ms(live ? live.rtt ?? n.rtt : n.rtt)}</b></div>
+    <div><small>抖动</small><b>${ms(n.jitter)}</b></div>
+    <div><small>丢包</small><b class="${lossCls(live ? live.loss : n.loss)}">${pct(live ? live.loss ?? n.loss : n.loss)}</b></div>
+    <div><small>速度</small><b>${mbps(n.mbps)}</b></div></div>
+  <div class="kv"><span>运营商</span><span>${esc(n.isp)||"–"}</span><span>城市</span><span>${esc(n.city)||"–"}</span>
+  <span>出口 IP</span><span>${esc(n.exit_ip)||"–"}</span><span>握手</span><span>${ms(n.handshake_ms)}</span>
+  <span>已连接</span><span>${since(n.since)}</span></div>`;
+}
+
+function render(s) {
+  state = s;
+  $("ver").textContent = "v" + s.version;
+  $("status").innerHTML = esc(s.status) + (s.locked ? ' · <span class="warn">已锁定节点</span>' : "");
+  $("lockBtn").textContent = s.locked ? "解除锁定" : "锁定当前节点";
+  $("active").innerHTML = nodeCard(s.active, s.live);
+  $("standby").innerHTML = nodeCard(s.standby);
+  const host = location.hostname.includes(":") ? `[${location.hostname}]` : location.hostname;
+  const auth = s.proxy.user ? `${encodeURIComponent(s.proxy.user)}:${encodeURIComponent(s.proxy.password)}@` : "";
+  const socks = `socks5h://${auth}${host}:${s.proxy.port}`, http = `http://${auth}${host}:${s.proxy.port}`;
+  $("proxy").innerHTML = `<div class="kv"><span>SOCKS5</span><code class="copy" title="点击复制">${esc(socks)}</code>
+  <span>HTTP</span><code class="copy" title="点击复制">${esc(http)}</code>
+  <span>连接</span><span>${s.proxy.active} 活动 / ${s.proxy.total} 累计</span>
+  <span>流量</span><span>↑ ${bytes(s.proxy.bytes_up)} ↓ ${bytes(s.proxy.bytes_down)}</span></div>
+  <p class="sub">经专线中转时，把主机名换成专线入口地址和端口。</p>`;
+  $("nodes").innerHTML = s.nodes.map(n => {
+    const role = n.role === "active" ? '<span class="ok">● 使用中</span>' : n.role === "standby" ? '<span class="warn">● 备用</span>' : "";
+    const failed = n.failed_until * 1000 > Date.now();
+    const st = role || (failed ? `<span class="bad">冷却中</span>` : n.rtt != null ? '<span class="muted">已测试</span>' : "");
+    return `<tr class="${n.role === "active" ? "active" : ""}"><td>${esc(n.ip)}</td><td>${KIND[n.kind]||n.kind}</td>
+    <td>${esc(n.isp)}</td><td>${esc(n.city)}</td><td>${n.proto.toUpperCase()}:${n.port}</td><td>${ms(n.direct_rtt)}</td>
+    <td>${ms(n.rtt)}</td><td>${ms(n.jitter)}</td><td class="${lossCls(n.loss)}">${pct(n.loss)}</td><td>${mbps(n.mbps)}</td>
+    <td>${n.score ?? "–"}</td><td>${st} <span class="err" title="${esc(n.error)}">${n.role ? "" : esc(n.error)}</span></td>
+    <td>${n.role === "active" ? "" : `<button data-id="${esc(n.id)}">切换</button>`}</td></tr>`;
+  }).join("");
+  const logs = $("logs"), atBottom = logs.scrollTop + logs.clientHeight >= logs.scrollHeight - 4;
+  logs.textContent = s.logs.join("\n");
+  if (atBottom) logs.scrollTop = logs.scrollHeight;
+}
+
+async function poll() {
+  try { render(await api("/api/status")); } catch (e) { $("status").textContent = "无法连接后台: " + e.message; }
+}
+
+document.addEventListener("click", async e => {
+  const t = e.target;
+  if (t.classList.contains("copy")) { navigator.clipboard?.writeText(t.textContent); t.style.borderColor = "var(--ok)"; return; }
+  if (t.tagName !== "BUTTON") return;
+  t.disabled = true;
+  try {
+    if (t.dataset.id) { t.textContent = "连接中…"; await api("/api/switch", {id: t.dataset.id}); }
+    else if (t.id === "refreshBtn") await api("/api/refresh", {});
+    else if (t.id === "lockBtn") await api("/api/lock", {locked: !state.locked});
+  } catch (err) { alert(err.message); }
+  t.disabled = false;
+  poll();
+});
+
+poll(); setInterval(poll, 3000);
+</script>
+</body>
+</html>

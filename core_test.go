@@ -1,0 +1,176 @@
+package main
+
+import (
+	"context"
+	"math"
+	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+)
+
+func fixture(t *testing.T) []byte {
+	data, err := os.ReadFile("testdata/servers.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestParseCSV(t *testing.T) {
+	jp := ParseCSV(fixture(t), []string{"JP"})
+	if len(jp) != 3 {
+		t.Fatalf("want 3 JP nodes, got %d", len(jp))
+	}
+	protos := map[string]bool{}
+	for _, n := range jp {
+		protos[n.Proto] = true
+		if n.Country != "JP" || !strings.Contains(n.Config, "remote "+n.IP) {
+			t.Errorf("bad node %+v", n.ID)
+		}
+	}
+	if !protos["tcp"] || !protos["udp"] {
+		t.Errorf("want both protocols, got %v", protos)
+	}
+	if all := ParseCSV(fixture(t), nil); len(all) <= len(jp) {
+		t.Errorf("no-country filter returned %d", len(all))
+	}
+}
+
+func TestParseRemote(t *testing.T) {
+	if p, h, port := ParseRemote("proto tcp-client\nremote 1.2.3.4 995\n", "9.9.9.9"); p != "tcp" || h != "1.2.3.4" || port != 995 {
+		t.Errorf("got %s %s %d", p, h, port)
+	}
+	if p, h, port := ParseRemote("client\n", "9.9.9.9"); p != "udp" || h != "9.9.9.9" || port != 1194 {
+		t.Errorf("got %s %s %d", p, h, port)
+	}
+}
+
+func TestClassify(t *testing.T) {
+	academic := &Node{IP: "219.100.37.5"}
+	home := &Node{IP: "1.2.3.4"}
+	cases := []struct {
+		info ipInfo
+		node *Node
+		want string
+	}{
+		{ipInfo{Status: "success"}, academic, "academic"},
+		{ipInfo{Status: "fail"}, home, "unknown"},
+		{ipInfo{Status: "success", Hosting: true}, home, "hosting"},
+		{ipInfo{Status: "success", ISP: "Vultr Holdings"}, home, "hosting"},
+		{ipInfo{Status: "success", Mobile: true}, home, "mobile"},
+		{ipInfo{Status: "success", ISP: "NTT Communications"}, home, "residential"},
+	}
+	for _, c := range cases {
+		if got := Classify(c.info, c.node); got != c.want {
+			t.Errorf("Classify(%+v) = %s, want %s", c.info, got, c.want)
+		}
+	}
+}
+
+func TestScoreRanking(t *testing.T) {
+	mk := func(proto string, rtt, loss float64) *Node {
+		return &Node{Proto: proto, RTT: ptr(rtt), Jitter: ptr(1), Loss: ptr(loss)}
+	}
+	fastUDP, fastTCP, lossy, untested := mk("udp", 20, 0), mk("tcp", 20, 0), mk("udp", 15, 10), &Node{Proto: "udp"}
+	nodes := []*Node{untested, lossy, fastTCP, fastUDP}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Score(15) < nodes[j].Score(15) })
+	if nodes[0] != fastUDP || nodes[1] != fastTCP || nodes[2] != lossy || !math.IsInf(nodes[3].Score(15), 1) {
+		t.Errorf("unexpected ranking")
+	}
+}
+
+func TestFetchFallsBackToCache(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "servers.csv")
+	_ = os.WriteFile(cache, fixture(t), 0o600)
+	data, err := FetchCSV(context.Background(), []string{"http://127.0.0.1:9/"}, cache)
+	if err != nil || len(data) == 0 {
+		t.Fatalf("expected cache fallback, got %v", err)
+	}
+	_ = os.Remove(cache)
+	if _, err := FetchCSV(context.Background(), []string{"http://127.0.0.1:9/"}, cache); err == nil {
+		t.Fatal("expected error without cache")
+	}
+}
+
+func TestPingStats(t *testing.T) {
+	s := PingStats{Sent: 4, RTTs: []float64{10, 12, 11}}
+	if s.LossPct() != 25 || *s.Avg() != 11 || s.Jitter() != 1.5 {
+		t.Errorf("loss %v avg %v jitter %v", s.LossPct(), *s.Avg(), s.Jitter())
+	}
+	if (PingStats{Sent: 3}).LossPct() != 100 {
+		t.Error("empty stats should be 100% loss")
+	}
+}
+
+func TestICMPChecksum(t *testing.T) {
+	pkt := echoRequest(0x1234, 7)
+	if icmpChecksum(pkt) != 0 { // a packet with a valid checksum sums to zero
+		t.Error("bad checksum")
+	}
+}
+
+func TestIsPublicIP(t *testing.T) {
+	if !isPublicIP(net.ParseIP("1.1.1.1")) {
+		t.Error("1.1.1.1 should be public")
+	}
+	for _, ip := range []string{"127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.1.1", "100.64.0.1", "::1", "0.0.0.0"} {
+		if isPublicIP(net.ParseIP(ip)) {
+			t.Errorf("%s should not be public", ip)
+		}
+	}
+}
+
+func TestOpenVPNArgs(t *testing.T) {
+	udp := strings.Join(OpenVPNArgs("/c.ovpn", "/a", "vg3", "udp", [2]int{2, 6}), " ")
+	for _, want := range []string{"--dev vg3", "--route-nopull", "--fast-io", "--sndbuf 4194304", "--mssfix 1360",
+		"--data-ciphers AES-128-GCM", "--data-ciphers-fallback AES-128-CBC", "--ping-exit 25"} {
+		if !strings.Contains(udp, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+	if strings.Index(udp, "--config") > strings.Index(udp, "--data-ciphers") {
+		t.Error("CLI options must come after --config to override the file")
+	}
+	tcp := strings.Join(OpenVPNArgs("/c", "/a", "vg0", "tcp", [2]int{2, 4}), " ")
+	if strings.Contains(tcp, "--fast-io") || strings.Contains(tcp, "--data-ciphers") {
+		t.Error("tcp / OpenVPN 2.4 must not get UDP or NCP options")
+	}
+}
+
+func TestConfig(t *testing.T) {
+	t.Setenv("WEB_PASS", "x")
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.WebPort != 54345 || c.ProxyPort != 7928 || c.Countries[0] != "JP" || !c.ResidentialOnly || !c.Standby {
+		t.Errorf("unexpected defaults %+v", c)
+	}
+	t.Setenv("PROXY_ALLOW", "203.0.113.0/24, 198.51.100.7")
+	t.Setenv("COUNTRIES", "jp,kr")
+	t.Setenv("WEB_PORT", "99999")
+	c, err = LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.ProxyAllow) != 2 || c.Countries[1] != "KR" || c.WebPort != 65535 {
+		t.Errorf("env parsing: %+v", c)
+	}
+	t.Setenv("WEB_PASS", "")
+	if _, err := LoadConfig(); err == nil {
+		t.Error("empty WEB_PASS must be rejected")
+	}
+}
+
+func TestSetEnv(t *testing.T) {
+	got := setEnv("A=1\nWEB_PASS=old\n# WEB_PASS=x\n", "WEB_PASS", "new$1")
+	if got != "A=1\nWEB_PASS=new$1\n# WEB_PASS=x\n" {
+		t.Errorf("got %q", got)
+	}
+	if s := randomString(20); len(s) != 20 {
+		t.Error("bad random length")
+	}
+}

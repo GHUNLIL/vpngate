@@ -1,0 +1,16 @@
+[Unit]
+Description=VPNGATE - VPNGate residential exit gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/vpngate/vpngate.env
+ExecStart=/usr/local/bin/vpngate run
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

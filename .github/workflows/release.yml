@@ -1,0 +1,22 @@
+# Push a tag like v1.0.0 to build static binaries and publish a GitHub Release.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make test
+      - run: make release VERSION=${GITHUB_REF_NAME#v} REPO=${{ github.repository }}
+      - run: sed -i "s#YOUR_GITHUB_USER/vpngate#${{ github.repository }}#g" dist/install.sh
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
