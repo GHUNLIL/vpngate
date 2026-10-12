@@ -28,8 +28,14 @@ const (
 	tableBase = 1000
 )
 
-var fatalMarkers = []string{"auth_failed", "authentication failed", "cannot ioctl", "fatal error",
-	"cannot open tun", "options error"}
+// Lines that mean the handshake failed for good. Note "Options error ... [PUSH-OPTIONS]" is only a
+// warning about a pushed option we filtered, so it must not count.
+var fatalMarkers = []string{"auth_failed", "authentication failed", "exiting due to fatal error",
+	"cannot open tun", "cannot ioctl"}
+
+// Lines too generic to explain a failure on their own.
+var noiseMarkers = []string{"exiting due to fatal error", "sigterm", "sigusr1", "process exiting",
+	"restart pause", "closing tun", "ifconfig_pool"}
 
 type Tunnel struct {
 	Node      *Node
@@ -39,11 +45,11 @@ type Tunnel struct {
 	Probe     string // health-check method: "icmp", or "tcp" for nodes that drop ICMP
 	StartedAt time.Time
 
-	conf    string
-	cmd     *exec.Cmd
-	exited  chan struct{}
-	mu      sync.Mutex
-	lastLog string
+	conf   string
+	cmd    *exec.Cmd
+	exited chan struct{}
+	mu     sync.Mutex
+	recent []string // last informative output lines, for error messages
 }
 
 func NewTunnel(n *Node, slot int, runDir string) *Tunnel {
@@ -58,7 +64,8 @@ func OpenVPNArgs(conf, auth, dev, proto string, version [2]int) []string {
 		"--dev", dev, "--dev-type", "tun", "--txqueuelen", "1000",
 		"--route-nopull", // never touch the VPS's own routes
 		"--pull-filter", "ignore", "route-ipv6", "--pull-filter", "ignore", "ifconfig-ipv6",
-		"--pull-filter", "ignore", "ping-restart",
+		"--pull-filter", "ignore", "ping-restart", "--pull-filter", "ignore", "redirect-gateway",
+		"--pull-filter", "ignore", "dhcp-option", "--pull-filter", "ignore", "block-outside-dns",
 		"--auth-user-pass", auth, "--auth-nocache",
 		"--remote-cert-tls", "server",
 		"--resolv-retry", "0", "--connect-retry-max", "1", "--connect-timeout", "10",
@@ -66,7 +73,7 @@ func OpenVPNArgs(conf, auth, dev, proto string, version [2]int) []string {
 		"--ping", "5", "--ping-exit", "25",
 		// Japanese home lines are often PPPoE (MTU 1454); keep encapsulated packets under it.
 		"--mssfix", "1360",
-		"--verb", "3", "--mute-replay-warnings",
+		"--verb", "3", "--mute-replay-warnings", "--suppress-timestamps",
 	}
 	if version[0] > 2 || version[0] == 2 && version[1] >= 5 {
 		args = append(args, "--data-ciphers", "AES-128-GCM:AES-256-GCM:CHACHA20-POLY1305:AES-128-CBC",
@@ -116,16 +123,21 @@ func (t *Tunnel) Start(ctx context.Context, binary, auth string, version [2]int,
 		signalled := false
 		for sc.Scan() {
 			line := sc.Text()
-			t.mu.Lock()
-			t.lastLog = line
-			t.mu.Unlock()
 			lower := strings.ToLower(line)
+			if !containsAny(lower, noiseMarkers) {
+				t.mu.Lock()
+				t.recent = append(t.recent, line)
+				if len(t.recent) > 8 {
+					t.recent = t.recent[1:]
+				}
+				t.mu.Unlock()
+			}
 			switch {
 			case !signalled && strings.Contains(lower, "initialization sequence completed"):
 				ready <- nil
 				signalled = true
 			case !signalled && containsAny(lower, fatalMarkers):
-				ready <- errors.New(tail(line, 160))
+				ready <- errors.New(t.LastLog())
 				signalled = true
 			case signalled && containsAny(lower, []string{"error", "restart", "exiting"}):
 				log.Printf("[%s] %s", t.Dev, line)
@@ -133,7 +145,7 @@ func (t *Tunnel) Start(ctx context.Context, binary, auth string, version [2]int,
 		}
 		_ = cmd.Wait()
 		if !signalled {
-			ready <- fmt.Errorf("OpenVPN 已退出: %s", tail(t.LastLog(), 160))
+			ready <- fmt.Errorf("OpenVPN 已退出: %s", t.LastLog())
 		}
 		close(t.exited)
 	}()
@@ -170,10 +182,14 @@ func (t *Tunnel) Alive() bool {
 	}
 }
 
+// LastLog returns the most recent informative OpenVPN line (the cause, not "exiting").
 func (t *Tunnel) LastLog() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.lastLog
+	if len(t.recent) == 0 {
+		return "无输出"
+	}
+	return tail(t.recent[len(t.recent)-1], 160)
 }
 
 func (t *Tunnel) setupRouting() error {

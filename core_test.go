@@ -140,6 +140,16 @@ func TestOpenVPNArgs(t *testing.T) {
 	}
 }
 
+func TestPushedOptionWarningIsNotFatal(t *testing.T) {
+	warn := strings.ToLower("Options error: option 'dhcp-option' cannot be used in this context ([PUSH-OPTIONS])")
+	if containsAny(warn, fatalMarkers) {
+		t.Error("pushed-option warning must not abort the handshake")
+	}
+	if !containsAny("exiting due to fatal error", fatalMarkers) || !containsAny("auth_failed", fatalMarkers) {
+		t.Error("real failures must be fatal")
+	}
+}
+
 func TestConfig(t *testing.T) {
 	t.Setenv("WEB_PASS", "x")
 	c, err := LoadConfig()
