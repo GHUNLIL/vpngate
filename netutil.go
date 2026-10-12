@@ -121,8 +121,8 @@ func icmpChecksum(b []byte) uint16 {
 	return ^uint16(sum)
 }
 
-func echoRequest(id, seq uint16) []byte {
-	pkt := make([]byte, 8+16)
+func echoRequest(id, seq uint16, size int) []byte {
+	pkt := make([]byte, 8+max(size, 16))
 	pkt[0] = 8 // echo request
 	binary.BigEndian.PutUint16(pkt[4:], id)
 	binary.BigEndian.PutUint16(pkt[6:], seq)
@@ -131,8 +131,9 @@ func echoRequest(id, seq uint16) []byte {
 	return pkt
 }
 
-// Ping sends ICMP echo requests over a raw socket (root / CAP_NET_RAW). Never fails: errors count as loss.
-func Ping(ctx context.Context, ip string, count int, interval, timeout time.Duration, dev string) PingStats {
+// Ping sends ICMP echo requests with size-byte payloads over a raw socket (root / CAP_NET_RAW).
+// Never fails: errors count as loss.
+func Ping(ctx context.Context, ip string, count, size int, interval, timeout time.Duration, dev string) PingStats {
 	stats := PingStats{Sent: count}
 	target := net.ParseIP(ip)
 	lc := net.ListenConfig{Control: bindControl(dev)}
@@ -177,7 +178,7 @@ func Ping(ctx context.Context, ip string, count int, interval, timeout time.Dura
 		mu.Lock()
 		sent[uint16(seq)] = time.Now()
 		mu.Unlock()
-		_, _ = conn.WriteTo(echoRequest(id, uint16(seq)), &net.IPAddr{IP: target})
+		_, _ = conn.WriteTo(echoRequest(id, uint16(seq), size), &net.IPAddr{IP: target})
 		if seq < count-1 {
 			select {
 			case <-time.After(interval):

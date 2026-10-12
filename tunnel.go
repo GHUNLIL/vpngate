@@ -44,12 +44,19 @@ type Tunnel struct {
 	Table     int
 	Probe     string // health-check method: "icmp", or "tcp" for nodes that drop ICMP
 	StartedAt time.Time
+	Live      LiveStats // real-time quality, written by the manager's monitor under Manager.mu
 
 	conf   string
 	cmd    *exec.Cmd
 	exited chan struct{}
 	mu     sync.Mutex
 	recent []string // last informative output lines, for error messages
+}
+
+// LiveStats is the rolling real-time quality of a running tunnel.
+type LiveStats struct {
+	Loss []float64 // loss % per monitor round, newest last
+	RTT  *float64  // smoothed latency
 }
 
 func NewTunnel(n *Node, slot int, runDir string) *Tunnel {
@@ -73,6 +80,8 @@ func OpenVPNArgs(conf, auth, dev, proto string, version [2]int) []string {
 		"--ping", "5", "--ping-exit", "25",
 		// Japanese home lines are often PPPoE (MTU 1454); keep encapsulated packets under it.
 		"--mssfix", "1360",
+		// Upper bound; the manager then probes each path and lowers the device MTU to what it carries.
+		"--tun-mtu", "1400",
 		"--verb", "3", "--mute-replay-warnings", "--suppress-timestamps",
 	}
 	if version[0] > 2 || version[0] == 2 && version[1] >= 5 {

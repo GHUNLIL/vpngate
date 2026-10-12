@@ -54,6 +54,7 @@ type Node struct {
 	Loss        *float64 `json:"loss"`
 	Mbps        *float64 `json:"mbps"`
 	ExitIP      string   `json:"exit_ip"`
+	MTU         int      `json:"mtu"` // largest inner packet the path carries (probed)
 	TestedAt    int64    `json:"tested_at"`
 	Error       string   `json:"error"`
 	FailedUntil int64    `json:"failed_until"`
@@ -357,6 +358,11 @@ func ClassifyNodes(ctx context.Context, nodes []*Node, cacheFile string) {
 			n.ISP = info.Org
 		}
 		n.City = info.City
+	}
+	for ip, info := range cache { // VPNGate IPs churn: don't let the cache grow forever
+		if now-info.At > 7*86400 {
+			delete(cache, ip)
+		}
 	}
 	if data, err := json.Marshal(cache); err == nil {
 		_ = os.WriteFile(cacheFile, data, 0o600)

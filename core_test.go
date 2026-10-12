@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -118,7 +117,7 @@ func TestPingStats(t *testing.T) {
 }
 
 func TestICMPChecksum(t *testing.T) {
-	pkt := echoRequest(0x1234, 7)
+	pkt := echoRequest(0x1234, 7, 1200)
 	if icmpChecksum(pkt) != 0 { // a packet with a valid checksum sums to zero
 		t.Error("bad checksum")
 	}
@@ -186,24 +185,6 @@ func TestNativeUDPVariants(t *testing.T) {
 	}
 }
 
-func TestPickCandidatesKeepsUDP(t *testing.T) {
-	var sorted []*Node
-	for i := 0; i < 8; i++ {
-		sorted = append(sorted, &Node{ID: strconv.Itoa(i), Proto: "tcp"})
-	}
-	sorted = append(sorted, &Node{ID: "u1", Proto: "udp"}, &Node{ID: "u2", Proto: "udp"}, &Node{ID: "u3", Proto: "udp"})
-	var ids []string
-	for _, n := range pickCandidates(sorted, 6, 2) {
-		ids = append(ids, n.ID)
-	}
-	if strings.Join(ids, ",") != "0,1,2,3,u2,u1" {
-		t.Errorf("got %v", ids)
-	}
-	if len(pickCandidates(sorted[:3], 6, 2)) != 3 {
-		t.Error("short list must be returned as is")
-	}
-}
-
 func TestResolverServesStaleInstantly(t *testing.T) {
 	r := NewResolver([]string{"127.0.0.1"})
 	want := []net.IP{net.ParseIP("203.0.113.5")}
@@ -218,6 +199,49 @@ func TestResolverServesStaleInstantly(t *testing.T) {
 	r.mu.Unlock()
 	if !refreshing {
 		t.Error("stale entry should trigger a background refresh")
+	}
+}
+
+func TestRealtimeSwitching(t *testing.T) {
+	t.Setenv("WEB_PASS", "x")
+	t.Setenv("SS_PASSWORD", "y")
+	t.Setenv("DATA_DIR", t.TempDir())
+	cfg, _ := LoadConfig()
+	alive := func(id string, loss ...float64) *Tunnel {
+		tun := &Tunnel{Node: &Node{ID: id, IP: id}, exited: make(chan struct{}), Live: LiveStats{Loss: loss}}
+		return tun
+	}
+	rounds := func(v float64) []float64 { return []float64{v, v, v, v, v, v} }
+	cases := []struct {
+		name          string
+		active, stdby []float64
+		pinned, want  bool
+	}{
+		{"clean active stays", rounds(0), rounds(0), false, false},
+		{"lossy active, clean standby -> switch", rounds(20), rounds(0), false, true},
+		{"too few rounds -> wait", []float64{40, 40}, rounds(0), false, false},
+		{"standby not clearly better -> stay", rounds(8), rounds(5), false, false},
+		{"pinned lossy node stays", rounds(20), rounds(0), true, false},
+		{"dead active -> switch even without history", []float64{100, 100, 100}, []float64{0}, false, true},
+	}
+	for _, c := range cases {
+		m := NewManager(cfg)
+		a, s := alive("a", c.active...), alive("s", c.stdby...)
+		m.active, m.standby = a, s
+		if c.pinned {
+			m.lockedID = "a"
+		}
+		m.decide()
+		if switched := m.active == s; switched != c.want {
+			t.Errorf("%s: switched=%v", c.name, switched)
+		}
+	}
+	// A lossy standby is dropped so a clean one gets acquired.
+	m := NewManager(cfg)
+	m.active, m.standby = alive("a", rounds(0)...), alive("s", rounds(30)...)
+	m.decide()
+	if m.standby != nil {
+		t.Error("lossy standby should be released")
 	}
 }
 

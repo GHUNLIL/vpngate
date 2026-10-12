@@ -48,7 +48,7 @@ pre{margin:0;max-height:260px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,mon
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const ms = v => v == null ? "–" : v.toFixed(v < 10 ? 1 : 0) + " ms";
-const pct = v => v == null ? "–" : v.toFixed(0) + "%";
+const pct = v => v == null ? "–" : v.toFixed(v > 0 && v < 10 ? 1 : 0) + "%";
 const mbps = v => v ? v.toFixed(0) + " Mbps" : "–";
 const since = t => { if (!t) return "–"; let s = Math.floor(Date.now()/1000 - t); const h = Math.floor(s/3600), m = Math.floor(s%3600/60); return h ? `${h} 小时 ${m} 分` : `${m} 分`; };
 const KIND = {residential:"家宽", mobile:"移动", hosting:"机房", academic:"学术", unknown:"未知"};
@@ -67,16 +67,17 @@ function ssLink(ss, host) {
   return `ss://${user}@${host.includes(":") ? `[${host}]` : host}:${ss.port}#VPNGATE`;
 }
 
-function nodeCard(n, live) {
+function nodeCard(n) {
   if (!n) return '<span class="muted">无</span>';
   return `<div class="big">${esc(n.ip)} <span class="tag">${n.proto.toUpperCase()}</span> <span class="tag">${KIND[n.kind]||n.kind}</span></div>
   <div class="metrics">
-    <div><small>延迟</small><b>${ms(live ? live.rtt ?? n.rtt : n.rtt)}</b></div>
+    <div><small>实时延迟</small><b>${ms(n.live_rtt ?? n.rtt)}</b></div>
     <div><small>抖动</small><b>${ms(n.jitter)}</b></div>
-    <div><small>丢包</small><b class="${lossCls(live ? live.loss : n.loss)}">${pct(live ? live.loss ?? n.loss : n.loss)}</b></div>
+    <div><small>实时丢包</small><b class="${lossCls(n.live_loss ?? n.loss)}">${pct(n.live_loss ?? n.loss)}</b></div>
     <div><small>速度</small><b>${mbps(n.mbps)}</b></div></div>
   <div class="kv"><span>运营商</span><span>${esc(n.isp)||"–"}</span><span>城市</span><span>${esc(n.city)||"–"}</span>
   <span>出口 IP</span><span>${esc(n.exit_ip)||"–"}</span><span>握手</span><span>${ms(n.handshake_ms)}</span>
+  <span>MTU</span><span>${n.mtu || "–"}</span>
   <span>已连接</span><span>${since(n.since)}</span></div>`;
 }
 
@@ -87,7 +88,7 @@ function render(s) {
   $("status").innerHTML = esc(s.status) + (s.locked ? ' · <span class="warn">已锁定节点</span>' : left != null ? ` · ${left} 分钟后重选` : "");
   $("ruleTitle").textContent = `节点（速度 ≥ ${s.min_mbps} Mbps 且丢包 ≤ 5% 合格，合格中延迟最低者优先；每 ${s.hold_minutes} 分钟重选）`;
   $("lockBtn").textContent = s.locked ? "解除锁定" : "锁定当前节点";
-  $("active").innerHTML = nodeCard(s.active, s.live);
+  $("active").innerHTML = nodeCard(s.active);
   $("standby").innerHTML = nodeCard(s.standby);
   const host = location.hostname;
   const clash = `- {name: 日本家宽, type: ss, server: ${host}, port: ${s.ss.port}, cipher: ${s.ss.method}, password: "${s.ss.password}", udp: true}`;

@@ -71,8 +71,8 @@ func LoadConfig() (*Config, error) {
 		Hold:             time.Duration(num("HOLD_MINUTES", 90, 5, 10080)) * time.Minute,
 		MinMbps:          float64(num("MIN_MBPS", 50, 0, 10000)),
 		ProbeTarget:      str("PROBE_TARGET", "1.1.1.1"),
-		MonitorInterval:  time.Duration(num("MONITOR_INTERVAL", 5, 1, 60)) * time.Second,
-		FailLossPct:      float64(num("FAIL_LOSS_PCT", 30, 1, 100)),
+		MonitorInterval:  time.Duration(num("MONITOR_INTERVAL", 2, 1, 60)) * time.Second,
+		FailLossPct:      float64(num("FAIL_LOSS_PCT", 5, 1, 100)),
 		DNSServers:       list("DNS_SERVERS", "1.1.1.1,8.8.8.8"),
 	}
 	for i, cc := range c.Countries {

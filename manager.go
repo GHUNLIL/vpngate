@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,11 +27,15 @@ import (
 const (
 	failBackoff     = 30 * time.Minute // node failed to connect
 	degradedBackoff = 10 * time.Minute // node connected but went bad
-	healthWindow    = 12               // loss samples kept (~1 min at 5 s)
 	speedtestURL    = "https://speed.cloudflare.com/__down?bytes=%d"
 	exitInfoURL     = "http://ip-api.com/json/?fields=query"
-	// UDP nodes often drop ICMP, so stage 1 cannot rank them; always give a few a real tunnel test.
-	minUDPCandidates = 2
+
+	// Real-time monitoring: every MONITOR_INTERVAL both active and standby get probeCount pings of
+	// probeSize bytes (close to real traffic, so paths that drop large packets show up).
+	probeSize  = 1200
+	probeCount = 5
+	liveRounds = 15 // rounds kept per tunnel (~30 s at 2 s)
+	minRounds  = 6  // rounds needed before a loss-based switch (~12 s, 30 packets)
 )
 
 type Manager struct {
@@ -46,8 +51,6 @@ type Manager struct {
 	lockedID    string // user-pinned node: keep this exit IP
 	activeSince time.Time
 	status      string
-	liveRTT     *float64
-	window      []float64
 	lastRefresh int64
 	slots       []int
 
@@ -104,7 +107,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	if state.Last != nil && state.Last.Config != "" && m.transportOK(state.Last) {
 		m.nodes[state.Last.ID] = state.Last
 		log.Printf("尝试恢复上次使用的节点 %s (保持出口 IP 不变)", state.Last.IP)
-		if t := m.evaluate(ctx, state.Last, false); t != nil {
+		if t := m.evaluate(ctx, state.Last); t != nil {
 			m.mu.Lock()
 			m.setActive(t)
 			if state.ActiveSince > 0 { // a restart does not reset the hold period
@@ -186,11 +189,15 @@ func (m *Manager) SwitchTo(ctx context.Context, id string) error {
 	n.FailedUntil = 0
 	m.mu.Unlock()
 	if t == nil {
-		if t = m.evaluate(ctx, n, true); t == nil {
+		if t = m.evaluate(ctx, n); t == nil {
 			m.mu.RLock()
 			defer m.mu.RUnlock()
 			return fmt.Errorf("连接失败: %s", n.Error)
 		}
+		mbps := m.speedtest(ctx, t)
+		m.mu.Lock()
+		n.Mbps = mbps
+		m.mu.Unlock()
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -423,15 +430,15 @@ func (m *Manager) reselect(ctx context.Context, fresh []*Tunnel) {
 		if len(fresh) > 0 && !m.transportOK(t.Node) {
 			continue // replaced by a node on the configured transport
 		}
-		if m.measure(ctx, t, true) == nil {
+		if m.measure(ctx, t) == nil {
 			all = append(all, t)
 		}
 	}
+	m.rankWithSpeed(ctx, all)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.status = "运行中"
-	m.sortTunnels(all)
 	log.Printf("定时重选排名 (速度 ≥ %.0f Mbps 合格，合格中延迟最低者优先):", m.cfg.MinMbps)
 	for i, t := range all {
 		tag := ""
@@ -516,7 +523,7 @@ func (m *Manager) restoreLocked(ctx context.Context) {
 	}
 	m.mu.Unlock()
 	if t == nil {
-		t = m.evaluate(ctx, n, false)
+		t = m.evaluate(ctx, n)
 	}
 	if t != nil {
 		m.mu.Lock()
@@ -531,7 +538,9 @@ func (m *Manager) acquire(ctx context.Context) []*Tunnel {
 	cands := m.pool()
 	sort.Slice(cands, func(i, j int) bool { return cands[i].PrefilterKey() < cands[j].PrefilterKey() })
 	m.mu.RUnlock()
-	cands = pickCandidates(cands, m.cfg.DeepTestCount, minUDPCandidates)
+	if len(cands) > m.cfg.DeepTestCount {
+		cands = cands[:m.cfg.DeepTestCount]
+	}
 	if len(cands) == 0 {
 		return nil
 	}
@@ -545,7 +554,7 @@ func (m *Manager) acquire(ctx context.Context) []*Tunnel {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i] = m.evaluate(ctx, n, true)
+			results[i] = m.evaluate(ctx, n)
 		}(i, n)
 	}
 	wg.Wait()
@@ -555,8 +564,8 @@ func (m *Manager) acquire(ctx context.Context) []*Tunnel {
 			tunnels = append(tunnels, t)
 		}
 	}
+	m.rankWithSpeed(ctx, tunnels)
 	m.mu.RLock()
-	m.sortTunnels(tunnels)
 	for _, t := range tunnels {
 		log.Printf("  %s", describe(t.Node))
 	}
@@ -564,38 +573,59 @@ func (m *Manager) acquire(ctx context.Context) []*Tunnel {
 	return tunnels
 }
 
-// pickCandidates takes the best n by stage-1 order, swapping the worst TCP picks for up to minUDP
-// UDP nodes: UDP avoids TCP-over-TCP stalls and usually has lower jitter under loss.
-func pickCandidates(sorted []*Node, n, minUDP int) []*Node {
-	if len(sorted) <= n {
-		return sorted
+// rankWithSpeed applies the rule with as few speed tests as possible: tunnels are tried in latency
+// order (loss-free first) and speed-tested only until enough of them qualify for active + standby.
+// The rest get no speed figure this round, which ranks them below the qualified ones.
+func (m *Manager) rankWithSpeed(ctx context.Context, ts []*Tunnel) {
+	need := 1
+	if m.cfg.Standby {
+		need = 2
 	}
-	picked := append([]*Node(nil), sorted[:n]...)
-	udp := 0
-	for _, c := range picked {
-		if c.Proto == "udp" {
-			udp++
+	m.mu.Lock()
+	for _, t := range ts {
+		t.Node.Mbps = nil
+	}
+	sort.SliceStable(ts, func(i, j int) bool {
+		a, b := ts[i].Node, ts[j].Node
+		if la, lb := val(a.Loss) <= maxQualifiedLoss, val(b.Loss) <= maxQualifiedLoss; la != lb {
+			return la
 		}
-	}
-	for _, c := range sorted[n:] {
-		if udp >= minUDP {
+		return val(a.RTT) < val(b.RTT)
+	})
+	m.mu.Unlock()
+	found := 0
+	for _, t := range ts {
+		m.mu.RLock()
+		lossOK := val(t.Node.Loss) <= maxQualifiedLoss
+		m.mu.RUnlock()
+		if found >= need || !lossOK || m.cfg.SpeedtestBytes == 0 {
 			break
 		}
-		if c.Proto != "udp" {
-			continue
+		mbps := m.speedtest(ctx, t)
+		m.mu.Lock()
+		t.Node.Mbps = mbps
+		if t.Node.Qualified(m.cfg.MinMbps) {
+			found++
 		}
-		for i := len(picked) - 1; i >= 0; i-- {
-			if picked[i].Proto == "tcp" {
-				picked[i] = c
-				udp++
-				break
-			}
-		}
+		m.mu.Unlock()
 	}
-	return picked
+	m.mu.Lock()
+	m.sortTunnels(ts)
+	m.mu.Unlock()
 }
 
-func (m *Manager) evaluate(ctx context.Context, n *Node, speedtest bool) *Tunnel {
+func (m *Manager) speedtest(ctx context.Context, t *Tunnel) *float64 {
+	if m.cfg.SpeedtestBytes == 0 {
+		return nil
+	}
+	v, err := SpeedTest(ctx, m.res, fmt.Sprintf(speedtestURL, m.cfg.SpeedtestBytes), t.Dev)
+	if err != nil {
+		return nil
+	}
+	return ptr(v)
+}
+
+func (m *Manager) evaluate(ctx context.Context, n *Node) *Tunnel {
 	m.mu.Lock()
 	if len(m.slots) == 0 {
 		m.mu.Unlock()
@@ -612,7 +642,7 @@ func (m *Manager) evaluate(ctx context.Context, n *Node, speedtest bool) *Tunnel
 		m.mu.Lock()
 		n.HandshakeMs = ptr(hs)
 		m.mu.Unlock()
-		err = m.measure(ctx, t, speedtest)
+		err = m.measure(ctx, t)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -627,8 +657,25 @@ func (m *Manager) evaluate(ctx context.Context, n *Node, speedtest bool) *Tunnel
 	return t
 }
 
-func (m *Manager) measure(ctx context.Context, t *Tunnel, speedtest bool) error {
-	st := Ping(ctx, m.cfg.ProbeTarget, 20, 100*time.Millisecond, time.Second, t.Dev)
+// probeMTU finds the largest inner packet this node's path actually delivers and sets the device
+// MTU to it. Paths differ (PPPoE, MAP-E, DS-Lite...): oversized packets are silently dropped, so
+// a right-sized MTU lets the kernel size TCP segments and UDP datagrams to fit.
+func (m *Manager) probeMTU(ctx context.Context, t *Tunnel) int {
+	mtu := 1280
+	for _, size := range []int{1400, 1380, 1360, 1340, 1320, 1300} {
+		if st := Ping(ctx, m.cfg.ProbeTarget, 3, size-28, 50*time.Millisecond, time.Second, t.Dev); len(st.RTTs) >= 2 {
+			mtu = size
+			break
+		}
+	}
+	_ = ipCmd("link", "set", "dev", t.Dev, "mtu", strconv.Itoa(mtu))
+	return mtu
+}
+
+// measure records MTU, latency, jitter, loss and exit IP through the tunnel (speed is separate).
+func (m *Manager) measure(ctx context.Context, t *Tunnel) error {
+	mtu := m.probeMTU(ctx, t)
+	st := Ping(ctx, m.cfg.ProbeTarget, 20, probeSize, 100*time.Millisecond, time.Second, t.Dev)
 	probe := "icmp"
 	if len(st.RTTs) == 0 { // some nodes drop ICMP: fall back to TCP handshakes
 		st, probe = m.tcpProbe(ctx, t.Dev, 3), "tcp"
@@ -645,23 +692,15 @@ func (m *Manager) measure(ctx context.Context, t *Tunnel, speedtest bool) error 
 			exitIP = info.Query
 		}
 	}
-	var mbps *float64
-	if speedtest && m.cfg.SpeedtestBytes > 0 {
-		if v, err := SpeedTest(ctx, m.res, fmt.Sprintf(speedtestURL, m.cfg.SpeedtestBytes), t.Dev); err == nil {
-			mbps = ptr(v)
-		}
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := t.Node
 	t.Probe = probe
+	n.MTU = mtu
 	n.RTT, n.Jitter, n.Loss = st.Avg(), ptr(st.Jitter()), ptr(st.LossPct())
 	n.TestedAt = time.Now().Unix()
 	if exitIP != "" {
 		n.ExitIP = exitIP
-	}
-	if speedtest {
-		n.Mbps = mbps // a failed speed test counts as unqualified, not as the old value
 	}
 	return nil
 }
@@ -681,8 +720,6 @@ func (m *Manager) tcpProbe(ctx context.Context, dev string, count int) PingStats
 func (m *Manager) setActive(t *Tunnel) {
 	m.active = t
 	m.activeSince = time.Now()
-	m.window = m.window[:0]
-	m.liveRTT = t.Node.RTT
 	log.Printf("当前节点: %s", describe(t.Node))
 	m.saveState()
 }
@@ -745,6 +782,9 @@ func (m *Manager) setStatus(s string) {
 
 // ---------------------------------------------------------------- monitoring
 
+// monitor watches active and standby in real time. Every MONITOR_INTERVAL both are probed in
+// parallel; the active is switched to the standby as soon as its recent loss exceeds FAIL_LOSS_PCT
+// while the standby is clean, or immediately when it stops answering.
 func (m *Manager) monitor(ctx context.Context) {
 	tick := time.NewTicker(m.cfg.MonitorInterval)
 	defer tick.Stop()
@@ -754,9 +794,23 @@ func (m *Manager) monitor(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		m.checkActive(ctx)
-		if i%6 == 0 {
-			m.checkStandby(ctx)
+		m.mu.RLock()
+		tunnels := []*Tunnel{m.active, m.standby}
+		m.mu.RUnlock()
+		var wg sync.WaitGroup
+		for _, t := range tunnels {
+			if t != nil {
+				wg.Add(1)
+				go func(t *Tunnel) {
+					defer wg.Done()
+					m.observe(ctx, t)
+				}(t)
+			}
+		}
+		wg.Wait()
+		m.decide()
+		if i%15 == 0 {
+			m.housekeeping()
 		}
 	}
 }
@@ -768,85 +822,99 @@ func (m *Manager) probe(ctx context.Context, t *Tunnel, count int) PingStats {
 	if mode == "tcp" {
 		return m.tcpProbe(ctx, t.Dev, count)
 	}
-	return Ping(ctx, m.cfg.ProbeTarget, count, 200*time.Millisecond, time.Second, t.Dev)
+	return Ping(ctx, m.cfg.ProbeTarget, count, probeSize, 100*time.Millisecond, time.Second, t.Dev)
 }
 
-func (m *Manager) checkActive(ctx context.Context) {
-	m.mu.RLock()
-	t := m.active
-	m.mu.RUnlock()
-	if t == nil {
-		return
+// observe adds one monitoring round to the tunnel's live stats.
+func (m *Manager) observe(ctx context.Context, t *Tunnel) {
+	st := PingStats{Sent: probeCount}
+	if t.Alive() {
+		st = m.probe(ctx, t, probeCount)
 	}
-	if !t.Alive() {
-		m.mu.Lock()
-		if m.active == t {
-			m.failover("OpenVPN 进程退出: " + tail(t.LastLog(), 80))
-		}
-		m.mu.Unlock()
-		return
-	}
-	st := m.probe(ctx, t, 3)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.active != t {
-		return
-	}
-	m.window = append(m.window, st.LossPct())
-	if len(m.window) > healthWindow {
-		m.window = m.window[1:]
+	l := &t.Live
+	l.Loss = append(l.Loss, st.LossPct())
+	if len(l.Loss) > liveRounds {
+		l.Loss = l.Loss[1:]
 	}
 	if avg := st.Avg(); avg != nil {
-		if m.liveRTT == nil {
-			m.liveRTT = avg
+		if l.RTT == nil {
+			l.RTT = avg
 		} else {
-			m.liveRTT = ptr(0.8**m.liveRTT + 0.2**avg)
+			l.RTT = ptr(0.7**l.RTT + 0.3**avg)
 		}
-	}
-	w := m.window
-	if len(w) >= 3 && w[len(w)-1] >= 100 && w[len(w)-2] >= 100 && w[len(w)-3] >= 100 {
-		m.failover("连续 3 次检测无响应")
-	} else if len(w) == healthWindow && mean(w) > m.cfg.FailLossPct {
-		m.failover(fmt.Sprintf("持续丢包 %.0f%%", mean(w)))
 	}
 }
 
-func (m *Manager) checkStandby(ctx context.Context) {
+func dead(loss []float64) bool {
+	n := len(loss)
+	return n >= 3 && loss[n-1] >= 100 && loss[n-2] >= 100 && loss[n-3] >= 100
+}
+
+// decide applies the real-time switching rules (see monitor).
+func (m *Manager) decide() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, s := m.active, m.standby
+	if a == nil {
+		return
+	}
+	limit := m.cfg.FailLossPct
+	if s != nil {
+		sl := s.Live.Loss
+		if !s.Alive() || dead(sl) || len(sl) >= minRounds && mean(sl) > limit {
+			log.Printf("备用节点 %s 质量下降 (丢包 %.1f%%)，重新补充", s.Node.IP, meanOr(sl))
+			s.Node.FailedUntil = time.Now().Add(degradedBackoff).Unix()
+			m.release(s)
+			m.RequestRefresh()
+			s = nil
+		}
+	}
+	al := a.Live.Loss
+	switch {
+	case !a.Alive():
+		m.failover("OpenVPN 进程退出: " + tail(a.LastLog(), 80))
+	case dead(al):
+		m.failover("连续 3 轮检测无响应")
+	case len(al) >= minRounds && mean(al) > limit && m.lockedID != a.Node.ID:
+		if s != nil && len(s.Live.Loss) >= minRounds && mean(s.Live.Loss) < mean(al)/2 {
+			m.failover(fmt.Sprintf("实时丢包 %.1f%%，切到备用 (丢包 %.1f%%)", mean(al), mean(s.Live.Loss)))
+		} else if s == nil {
+			m.RequestRefresh() // find a clean standby to switch to
+		}
+	}
+}
+
+// housekeeping refills a missing standby and moves back to a recovered pinned node.
+func (m *Manager) housekeeping() {
 	m.mu.RLock()
-	t := m.standby
 	pinned := m.nodes[m.lockedID]
-	backToPinned := pinned != nil && m.active != nil && m.active.Node != pinned && !pinned.Failed(time.Now())
+	need := pinned != nil && m.active != nil && m.active.Node != pinned && !pinned.Failed(time.Now()) ||
+		m.cfg.Standby && m.standby == nil
 	m.mu.RUnlock()
-	if backToPinned {
+	if need {
 		m.RequestRefresh()
 	}
-	if t == nil {
-		if m.cfg.Standby {
-			m.RequestRefresh()
-		}
-		return
+}
+
+func meanOr(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
 	}
-	if t.Alive() && len(m.probe(ctx, t, 3).RTTs) > 0 {
-		return
-	}
-	m.mu.Lock()
-	if m.standby == t {
-		log.Printf("备用节点 %s 失效，重新补充", t.Node.IP)
-		t.Node.FailedUntil = time.Now().Add(degradedBackoff).Unix()
-		m.release(t)
-	}
-	m.mu.Unlock()
-	m.RequestRefresh()
+	return mean(xs)
 }
 
 // ---------------------------------------------------------------- snapshot & state
 
 type TunnelView struct {
 	Node
-	Dev       string `json:"dev"`
-	Alive     bool   `json:"alive"`
-	Since     int64  `json:"since"`
-	Qualified bool   `json:"qualified"`
+	Dev       string   `json:"dev"`
+	Alive     bool     `json:"alive"`
+	Since     int64    `json:"since"`
+	Qualified bool     `json:"qualified"`
+	LiveRTT   *float64 `json:"live_rtt"`  // smoothed, from the real-time monitor
+	LiveLoss  *float64 `json:"live_loss"` // over the last ~30 s
 }
 
 type NodeView struct {
@@ -864,7 +932,10 @@ func (m *Manager) Snapshot() map[string]any {
 			return nil
 		}
 		v := &TunnelView{Node: *t.Node, Dev: t.Dev, Alive: t.Alive(), Since: t.StartedAt.Unix(),
-			Qualified: t.Node.Qualified(minMbps)}
+			Qualified: t.Node.Qualified(minMbps), LiveRTT: t.Live.RTT}
+		if len(t.Live.Loss) > 0 {
+			v.LiveLoss = ptr(mean(t.Live.Loss))
+		}
 		v.Config = ""
 		return v
 	}
@@ -885,10 +956,6 @@ func (m *Manager) Snapshot() map[string]any {
 		}
 		list = append(list, v)
 	}
-	var loss *float64
-	if len(m.window) > 0 {
-		loss = ptr(mean(m.window))
-	}
 	var nextReselect int64
 	if m.active != nil && m.lockedID == "" {
 		nextReselect = m.activeSince.Add(m.cfg.Hold).Unix()
@@ -899,7 +966,6 @@ func (m *Manager) Snapshot() map[string]any {
 		"hold_minutes": int(m.cfg.Hold.Minutes()), "next_reselect": nextReselect,
 		"last_refresh": m.lastRefresh,
 		"active":       view(m.active), "standby": view(m.standby),
-		"live":  map[string]*float64{"rtt": m.liveRTT, "loss": loss},
 		"nodes": list,
 	}
 }
@@ -933,8 +999,8 @@ func describe(n *Node) string {
 	if isp == "" {
 		isp = "?"
 	}
-	return fmt.Sprintf("%s [%s %s %s] 延迟 %.0fms 抖动 %.1fms 丢包 %.0f%%%s",
-		n.IP, strings.ToUpper(n.Proto), n.Kind, isp, val(n.RTT), val(n.Jitter), val(n.Loss), speed)
+	return fmt.Sprintf("%s [%s %s %s] 延迟 %.0fms 抖动 %.1fms 丢包 %.0f%% MTU %d%s",
+		n.IP, strings.ToUpper(n.Proto), n.Kind, isp, val(n.RTT), val(n.Jitter), val(n.Loss), n.MTU, speed)
 }
 
 func mean(xs []float64) float64 {
