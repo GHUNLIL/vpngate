@@ -95,13 +95,13 @@ vpngate uninstall  卸载
   - UDP 节点加 `--fast-io` 和 4 MB 收发缓冲。
   - 优先协商 AES-GCM，回退 AES-128-CBC。
   - `--ping-exit 25`：隧道失联时快速退出，交给热备接管。
-- **内核**（`/etc/sysctl.d/99-vpngate.conf`）：
+- **内核**（`/etc/sysctl.d/98-vpngate.conf`）：
   - BBR + fq 拥塞控制。
-  - 大 TCP 缓冲。
   - `tcp_notsent_lowat`，降低排队延迟。
   - `tcp_mtu_probing`，防止大包被黑洞丢弃。
   - 关闭空闲后慢启动。
-  - `rp_filter=2`，策略路由需要宽松模式。
+  - 文件名用 `98-` 开头：服务器原有的 `99-*` 调优遇到相同参数时优先生效，不会被覆盖。
+  - `rp_filter` 只对隧道网卡设置，不改全局。
 
 ## 构建
 

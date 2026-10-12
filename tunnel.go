@@ -185,9 +185,8 @@ func (t *Tunnel) setupRouting() error {
 	if err := ipCmd("rule", "add", "oif", t.Dev, "lookup", table, "priority", prio); err != nil {
 		return err
 	}
-	for _, scope := range []string{"all", t.Dev} {
-		_ = os.WriteFile("/proc/sys/net/ipv4/conf/"+scope+"/rp_filter", []byte("2"), 0o644)
-	}
+	// Loose reverse-path filtering on our device only; the kernel uses max(all, dev).
+	_ = os.WriteFile("/proc/sys/net/ipv4/conf/"+t.Dev+"/rp_filter", []byte("2"), 0o644)
 	return nil
 }
 

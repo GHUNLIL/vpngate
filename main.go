@@ -32,7 +32,7 @@ const (
 	binPath  = "/usr/local/bin/vpngate"
 	envPath  = "/etc/vpngate/vpngate.env"
 	unitPath = "/etc/systemd/system/vpngate.service"
-	sysctl   = "/etc/sysctl.d/99-vpngate.conf"
+	sysctl   = "/etc/sysctl.d/98-vpngate.conf"
 )
 
 var (
@@ -40,7 +40,7 @@ var (
 	envTemplate string
 	//go:embed deploy/vpngate.service
 	unitFile string
-	//go:embed deploy/99-vpngate.conf
+	//go:embed deploy/98-vpngate.conf
 	sysctlFile string
 )
 
@@ -202,7 +202,7 @@ func install() error {
 	if err := os.WriteFile(sysctl, []byte(sysctlFile), 0o644); err != nil {
 		return err
 	}
-	_ = exec.Command("sysctl", "-q", "-p", sysctl).Run()
+	_ = exec.Command("sysctl", "-q", "--system").Run() // re-apply all files so host tuning keeps precedence
 	if out, _ := exec.Command("sysctl", "-n", "net.ipv4.tcp_congestion_control").Output(); strings.TrimSpace(string(out)) != "bbr" {
 		fmt.Println("提示: 内核不支持 BBR (需要 4.9+)，其他网络优化已生效")
 	}
