@@ -8,7 +8,7 @@ build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o vpngate .
 
 test:
-	go vet ./... && go test -race ./...
+	go vet ./... && CGO_ENABLED=1 go test -race ./...
 
 # Static Linux binaries for every supported VPS architecture.
 release:
