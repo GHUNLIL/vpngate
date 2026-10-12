@@ -37,6 +37,10 @@ type Proxy struct {
 	Allow    []*net.IPNet
 	MaxConns int64
 	Dial     Dial
+	// FastConnect answers CONNECT before the upstream handshake finishes, so the client's first
+	// bytes (TLS ClientHello) travel in parallel with the tunnel connect: one tunnel RTT saved per
+	// connection. A failed connect then shows up as a reset instead of an error reply.
+	FastConnect bool
 
 	Active   atomic.Int64
 	Total    atomic.Int64
@@ -271,7 +275,14 @@ func (p *Proxy) socks5(client net.Conn, br *bufio.Reader) (net.Conn, error) {
 		_, _ = client.Write(socksReply(7))
 		return nil, nil
 	}
-	up, err := p.open(host, int(binary.BigEndian.Uint16(pb)))
+	port := int(binary.BigEndian.Uint16(pb))
+	if p.FastConnect {
+		if _, err := client.Write(socksReply(0)); err != nil {
+			return nil, err
+		}
+		return p.openOrReset(client, host, port)
+	}
+	up, err := p.open(host, port)
 	if err != nil {
 		_, _ = client.Write(socksReply(err.(*proxyError).socksCode))
 		return nil, nil
@@ -302,6 +313,19 @@ func readUserPass(br *bufio.Reader) (string, string, error) {
 	}
 	pass, err := field()
 	return user, pass, err
+}
+
+// openOrReset dials after a success reply was already sent; on failure the client gets a TCP RST
+// so it fails fast rather than waiting on a dead connection.
+func (p *Proxy) openOrReset(client net.Conn, host string, port int) (net.Conn, error) {
+	up, err := p.open(host, port)
+	if err != nil {
+		if tc, ok := client.(*net.TCPConn); ok {
+			_ = tc.SetLinger(0)
+		}
+		return nil, nil
+	}
+	return up, nil
 }
 
 func socksReply(code byte) []byte { return []byte{5, code, 0, 1, 0, 0, 0, 0, 0, 0} }
@@ -344,6 +368,12 @@ func (p *Proxy) http(client net.Conn, br *bufio.Reader) (net.Conn, error) {
 	}
 	if strings.EqualFold(method, "CONNECT") {
 		host, port := splitHostPort(target, 443)
+		if p.FastConnect {
+			if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+				return nil, err
+			}
+			return p.openOrReset(client, host, port)
+		}
 		up, err := p.open(host, port)
 		if err != nil {
 			return nil, httpFail(client, err.(*proxyError).httpStatus)

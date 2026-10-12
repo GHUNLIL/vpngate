@@ -132,6 +132,37 @@ func TestSOCKS5Errors(t *testing.T) {
 	}
 }
 
+func TestFastConnectRepliesBeforeUpstream(t *testing.T) {
+	r := newRig(t, "", "", nil)
+	r.p.FastConnect = true
+	inner := r.p.Dial
+	r.p.Dial = func(ctx context.Context, host string, port int) (net.Conn, error) {
+		time.Sleep(300 * time.Millisecond) // slow tunnel connect
+		return inner(ctx, host, port)
+	}
+	c := r.dial(t)
+	start := time.Now()
+	c.Write([]byte("\x05\x01\x00\x05\x01\x00\x03\x04a.jp\x01\xbbhello"))
+	readN(t, c, 2)
+	if b := readN(t, c, 10); b[1] != 0 || time.Since(start) > 150*time.Millisecond {
+		t.Fatalf("reply %v after %v, want immediate success", b, time.Since(start))
+	}
+	if string(readN(t, c, 5)) != "hello" {
+		t.Fatal("data sent before upstream was ready got lost")
+	}
+	// A failed upstream after the optimistic reply must close the client connection.
+	c = r.dial(t)
+	c.Write([]byte("CONNECT blocked.test:443 HTTP/1.1\r\n\r\n"))
+	br := bufio.NewReader(c)
+	if line, _ := br.ReadString('\n'); !strings.Contains(line, "200") {
+		t.Fatalf("want optimistic 200, got %q", line)
+	}
+	br.ReadString('\n')
+	if _, err := br.ReadByte(); err == nil {
+		t.Error("connection should be closed when upstream fails")
+	}
+}
+
 func TestHTTPConnectAuth(t *testing.T) {
 	r := newRig(t, "u", "p", nil)
 	c := r.dial(t)

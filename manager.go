@@ -25,6 +25,8 @@ const (
 	healthWindow    = 12               // loss samples kept (~1 min at 5 s)
 	speedtestURL    = "https://speed.cloudflare.com/__down?bytes=%d"
 	exitInfoURL     = "http://ip-api.com/json/?fields=query"
+	// UDP nodes often drop ICMP, so stage 1 cannot rank them; always give a few a real tunnel test.
+	minUDPCandidates = 2
 )
 
 type Manager struct {
@@ -402,9 +404,7 @@ func (m *Manager) acquire(ctx context.Context) []*Tunnel {
 	cands := m.pool()
 	sort.Slice(cands, func(i, j int) bool { return cands[i].PrefilterKey(pen) < cands[j].PrefilterKey(pen) })
 	m.mu.RUnlock()
-	if len(cands) > m.cfg.DeepTestCount {
-		cands = cands[:m.cfg.DeepTestCount]
-	}
+	cands = pickCandidates(cands, m.cfg.DeepTestCount, minUDPCandidates)
 	if len(cands) == 0 {
 		return nil
 	}
@@ -435,6 +435,37 @@ func (m *Manager) acquire(ctx context.Context) []*Tunnel {
 	}
 	m.mu.RUnlock()
 	return tunnels
+}
+
+// pickCandidates takes the best n by stage-1 order, swapping the worst TCP picks for up to minUDP
+// UDP nodes: UDP avoids TCP-over-TCP stalls and usually has lower jitter under loss.
+func pickCandidates(sorted []*Node, n, minUDP int) []*Node {
+	if len(sorted) <= n {
+		return sorted
+	}
+	picked := append([]*Node(nil), sorted[:n]...)
+	udp := 0
+	for _, c := range picked {
+		if c.Proto == "udp" {
+			udp++
+		}
+	}
+	for _, c := range sorted[n:] {
+		if udp >= minUDP {
+			break
+		}
+		if c.Proto != "udp" {
+			continue
+		}
+		for i := len(picked) - 1; i >= 0; i-- {
+			if picked[i].Proto == "tcp" {
+				picked[i] = c
+				udp++
+				break
+			}
+		}
+	}
+	return picked
 }
 
 func (m *Manager) evaluate(ctx context.Context, n *Node, speedtest bool) *Tunnel {

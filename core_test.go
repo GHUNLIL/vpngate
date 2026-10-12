@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fixture(t *testing.T) []byte {
@@ -147,6 +149,41 @@ func TestPushedOptionWarningIsNotFatal(t *testing.T) {
 	}
 	if !containsAny("exiting due to fatal error", fatalMarkers) || !containsAny("auth_failed", fatalMarkers) {
 		t.Error("real failures must be fatal")
+	}
+}
+
+func TestPickCandidatesKeepsUDP(t *testing.T) {
+	var sorted []*Node
+	for i := 0; i < 8; i++ {
+		sorted = append(sorted, &Node{ID: strconv.Itoa(i), Proto: "tcp"})
+	}
+	sorted = append(sorted, &Node{ID: "u1", Proto: "udp"}, &Node{ID: "u2", Proto: "udp"}, &Node{ID: "u3", Proto: "udp"})
+	var ids []string
+	for _, n := range pickCandidates(sorted, 6, 2) {
+		ids = append(ids, n.ID)
+	}
+	if strings.Join(ids, ",") != "0,1,2,3,u2,u1" {
+		t.Errorf("got %v", ids)
+	}
+	if len(pickCandidates(sorted[:3], 6, 2)) != 3 {
+		t.Error("short list must be returned as is")
+	}
+}
+
+func TestResolverServesStaleInstantly(t *testing.T) {
+	r := NewResolver([]string{"127.0.0.1"})
+	want := []net.IP{net.ParseIP("203.0.113.5")}
+	r.cache["stale.test"] = dnsEntry{want, time.Now().Add(-10 * time.Minute)}
+	start := time.Now()
+	got, err := r.Resolve(context.Background(), "stale.test", "")
+	if err != nil || !got[0].Equal(want[0]) || time.Since(start) > 50*time.Millisecond {
+		t.Fatalf("stale entry not served instantly: %v %v %v", got, err, time.Since(start))
+	}
+	r.mu.Lock()
+	refreshing := r.inflight["stale.test"] != nil || r.cache["stale.test"].fetched.After(start)
+	r.mu.Unlock()
+	if !refreshing {
+		t.Error("stale entry should trigger a background refresh")
 	}
 }
 

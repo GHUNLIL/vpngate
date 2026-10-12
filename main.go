@@ -139,7 +139,7 @@ func run() error {
 
 	m := NewManager(cfg)
 	p := &Proxy{Addr: net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort)), User: cfg.ProxyUser,
-		Pass: cfg.ProxyPass, Allow: cfg.ProxyAllow, MaxConns: int64(cfg.ProxyMaxConns),
+		Pass: cfg.ProxyPass, Allow: cfg.ProxyAllow, MaxConns: int64(cfg.ProxyMaxConns), FastConnect: cfg.FastConnect,
 		Dial: TunnelDialer(m.res, m.Route)}
 	if err := p.Listen(); err != nil {
 		return err

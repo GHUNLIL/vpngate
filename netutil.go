@@ -170,11 +170,14 @@ func Ping(ctx context.Context, ip string, count int, interval, timeout time.Dura
 
 // ---------------------------------------------------------------- DNS
 
-const dnsTTL = 2 * time.Minute
+const (
+	dnsFresh = 2 * time.Minute  // answer from cache, no refresh
+	dnsStale = 30 * time.Minute // answer from cache instantly, refresh in the background
+)
 
 type dnsEntry struct {
 	ips     []net.IP
-	expires time.Time
+	fetched time.Time
 }
 
 type dnsCall struct {
@@ -183,8 +186,9 @@ type dnsCall struct {
 	err  error
 }
 
-// Resolver looks up IPv4 addresses through the tunnel device (so CDNs see a Japanese resolver)
-// and caches answers. Concurrent lookups of the same name share one query.
+// Resolver looks up IPv4 addresses through the tunnel device (so CDNs see a Japanese resolver) and
+// caches answers stale-while-revalidate: a repeat visit never waits on DNS. Concurrent lookups of
+// the same name share one query.
 type Resolver struct {
 	servers  []string
 	mu       sync.Mutex
@@ -201,36 +205,49 @@ func (r *Resolver) Resolve(ctx context.Context, host, dev string) ([]net.IP, err
 		return []net.IP{ip}, nil
 	}
 	r.mu.Lock()
-	if e, ok := r.cache[host]; ok && time.Now().Before(e.expires) {
+	e, cached := r.cache[host]
+	age := time.Since(e.fetched)
+	if cached && age < dnsStale {
+		if age >= dnsFresh && r.inflight[host] == nil {
+			r.startLocked(host, dev)
+		}
 		r.mu.Unlock()
 		return e.ips, nil
 	}
-	if call, ok := r.inflight[host]; ok {
-		r.mu.Unlock()
-		select {
-		case <-call.done:
-			return call.ips, call.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	call := r.inflight[host]
+	if call == nil {
+		call = r.startLocked(host, dev)
 	}
+	r.mu.Unlock()
+	select {
+	case <-call.done:
+		return call.ips, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// startLocked runs a lookup detached from any one request, so a cancelled client cannot fail
+// the query for everyone waiting on it. Caller holds r.mu.
+func (r *Resolver) startLocked(host, dev string) *dnsCall {
 	call := &dnsCall{done: make(chan struct{})}
 	r.inflight[host] = call
-	r.mu.Unlock()
-
-	call.ips, call.err = r.lookup(ctx, host, dev)
-
-	r.mu.Lock()
-	delete(r.inflight, host)
-	if call.err == nil {
-		if len(r.cache) > 8192 {
-			r.cache = map[string]dnsEntry{}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		call.ips, call.err = r.lookup(ctx, host, dev)
+		r.mu.Lock()
+		delete(r.inflight, host)
+		if call.err == nil {
+			if len(r.cache) > 16384 {
+				r.cache = map[string]dnsEntry{}
+			}
+			r.cache[host] = dnsEntry{call.ips, time.Now()}
 		}
-		r.cache[host] = dnsEntry{call.ips, time.Now().Add(dnsTTL)}
-	}
-	r.mu.Unlock()
-	close(call.done)
-	return call.ips, call.err
+		r.mu.Unlock()
+		close(call.done)
+	}()
+	return call
 }
 
 func (r *Resolver) lookup(ctx context.Context, host, dev string) ([]net.IP, error) {

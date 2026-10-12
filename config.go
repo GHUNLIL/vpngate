@@ -25,6 +25,7 @@ type Config struct {
 	ProxyPass     string
 	ProxyAllow    []*net.IPNet
 	ProxyMaxConns int
+	FastConnect   bool
 
 	Sources          []string
 	Countries        []string
@@ -57,6 +58,7 @@ func LoadConfig() (*Config, error) {
 		ProxyUser:        str("PROXY_USER", ""),
 		ProxyPass:        str("PROXY_PASS", ""),
 		ProxyMaxConns:    num("PROXY_MAX_CONNS", 8192, 16, 1<<20),
+		FastConnect:      boolEnv("FAST_CONNECT", true),
 		Sources:          list("SOURCES", "https://www.vpngate.net/api/iphone/,http://www.vpngate.net/api/iphone/"),
 		Countries:        list("COUNTRIES", "JP"),
 		ResidentialOnly:  boolEnv("RESIDENTIAL_ONLY", true),
