@@ -65,7 +65,7 @@ func LoadConfig() (*Config, error) {
 		ResidentialOnly:  boolEnv("RESIDENTIAL_ONLY", true),
 		DeepTestCount:    num("DEEP_TEST_COUNT", 6, 1, 30),
 		DeepTestParallel: num("DEEP_TEST_PARALLEL", 3, 1, 10),
-		SpeedtestBytes:   int64(num("SPEEDTEST_BYTES", 10_000_000, 0, 100_000_000)),
+		SpeedtestBytes:   int64(num("SPEEDTEST_BYTES", 4_000_000, 0, 100_000_000)),
 		Standby:          boolEnv("STANDBY", true),
 		Refresh:          time.Duration(num("REFRESH_MINUTES", 30, 5, 1440)) * time.Minute,
 		Hold:             time.Duration(num("HOLD_MINUTES", 90, 5, 10080)) * time.Minute,

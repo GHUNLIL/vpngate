@@ -348,8 +348,9 @@ func HTTPGet(ctx context.Context, r *Resolver, url, dev string) ([]byte, error) 
 	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 }
 
-// SpeedTest downloads n bytes through dev and returns Mbps measured over the body transfer.
-func SpeedTest(ctx context.Context, r *Resolver, url, dev string) (float64, error) {
+// SpeedTest downloads through dev and returns Mbps timed only after the first warm bytes, so TCP
+// slow start doesn't drag the figure down and the download can stay small.
+func SpeedTest(ctx context.Context, r *Resolver, url, dev string, warm int64) (float64, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	resp, err := httpClient(r, dev, 15*time.Second).Do(req)
 	if err != nil {
@@ -358,6 +359,9 @@ func SpeedTest(ctx context.Context, r *Resolver, url, dev string) (float64, erro
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return 0, errors.New(resp.Status)
+	}
+	if _, err := io.CopyN(io.Discard, resp.Body, warm); err != nil {
+		return 0, err
 	}
 	start := time.Now()
 	n, _ := io.Copy(io.Discard, resp.Body) // a timeout still leaves a usable partial measurement

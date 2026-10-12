@@ -30,12 +30,16 @@ const (
 	speedtestURL    = "https://speed.cloudflare.com/__down?bytes=%d"
 	exitInfoURL     = "http://ip-api.com/json/?fields=query"
 
-	// Real-time monitoring: every MONITOR_INTERVAL both active and standby get probeCount pings of
-	// probeSize bytes (close to real traffic, so paths that drop large packets show up).
-	probeSize  = 1200
-	probeCount = 5
-	liveRounds = 15 // rounds kept per tunnel (~30 s at 2 s)
-	minRounds  = 6  // rounds needed before a loss-based switch (~12 s, 30 packets)
+	// Deep tests ping with probeSize bytes (close to real traffic). The real-time monitor uses small
+	// monitorProbeSize pings to keep its own traffic low (~0.1 GB/day); large-packet problems are
+	// caught by the per-tunnel MTU probe, re-run every mtuRecheck rounds.
+	probeSize        = 1200
+	monitorProbeSize = 56
+	mtuRecheck       = 300 // ~10 min at 2 s
+	listMaxAge       = 3 * time.Hour
+	probeCount       = 5
+	liveRounds       = 15 // rounds kept per tunnel (~30 s at 2 s)
+	minRounds        = 6  // rounds needed before a loss-based switch (~12 s, 30 packets)
 )
 
 type Manager struct {
@@ -128,8 +132,11 @@ func (m *Manager) Run(ctx context.Context) {
 		case <-m.wake:
 		default:
 		}
-		if err := m.refresh(ctx); err != nil {
-			log.Printf("刷新节点列表失败: %v", err)
+		// The list (~1.3 MB) is only fetched when a selection is due, or when it is getting old.
+		if m.selectionDue() || time.Since(time.Unix(m.lastRefreshed(), 0)) > listMaxAge {
+			if err := m.refresh(ctx); err != nil {
+				log.Printf("刷新节点列表失败: %v", err)
+			}
 		}
 		m.selectMu.Lock()
 		m.ensure(ctx)
@@ -158,6 +165,26 @@ func (m *Manager) nextWake() time.Duration {
 		}
 	}
 	return wait
+}
+
+// selectionDue reports whether ensure will need candidates: no active, no standby, a pinned node to
+// return to, or the hold period is over.
+func (m *Manager) selectionDue() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.active == nil || !m.active.Alive() || m.cfg.Standby && (m.standby == nil || !m.standby.Alive()) {
+		return true
+	}
+	if pinned := m.nodes[m.lockedID]; pinned != nil && m.active.Node != pinned {
+		return true
+	}
+	return m.lockedID == "" && (time.Since(m.activeSince) >= m.cfg.Hold || !m.transportOK(m.active.Node))
+}
+
+func (m *Manager) lastRefreshed() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastRefresh
 }
 
 func (m *Manager) RequestRefresh() {
@@ -628,7 +655,7 @@ func (m *Manager) speedtest(ctx context.Context, t *Tunnel) *float64 {
 	if m.cfg.SpeedtestBytes == 0 {
 		return nil
 	}
-	v, err := SpeedTest(ctx, m.res, fmt.Sprintf(speedtestURL, m.cfg.SpeedtestBytes), t.Dev)
+	v, err := SpeedTest(ctx, m.res, fmt.Sprintf(speedtestURL, m.cfg.SpeedtestBytes), t.Dev, m.cfg.SpeedtestBytes/4)
 	if err != nil {
 		return nil
 	}
@@ -832,6 +859,13 @@ func (m *Manager) monitor(ctx context.Context) {
 		if i%15 == 0 {
 			m.housekeeping()
 		}
+		if i%mtuRecheck == 0 {
+			for _, t := range tunnels {
+				if t != nil && t.Alive() {
+					m.recheckMTU(ctx, t)
+				}
+			}
+		}
 	}
 }
 
@@ -842,7 +876,7 @@ func (m *Manager) probe(ctx context.Context, t *Tunnel, count int) PingStats {
 	if mode == "tcp" {
 		return m.tcpProbe(ctx, t.Dev, count)
 	}
-	return Ping(ctx, m.cfg.ProbeTarget, count, probeSize, 100*time.Millisecond, time.Second, t.Dev)
+	return Ping(ctx, m.cfg.ProbeTarget, count, monitorProbeSize, 100*time.Millisecond, time.Second, t.Dev)
 }
 
 // observe adds one monitoring round to the tunnel's live stats.
@@ -867,6 +901,17 @@ func (m *Manager) observe(ctx context.Context, t *Tunnel) {
 		} else {
 			l.RTT = ptr(0.7**l.RTT + 0.3**avg)
 		}
+	}
+}
+
+// recheckMTU re-probes a running tunnel's path MTU in case the line changed (a few packets).
+func (m *Manager) recheckMTU(ctx context.Context, t *Tunnel) {
+	mtu := m.probeMTU(ctx, t)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t.Node.MTU != mtu {
+		log.Printf("节点 %s 路径 MTU 变化: %d -> %d", t.Node.IP, t.Node.MTU, mtu)
+		t.Node.MTU = mtu
 	}
 }
 
