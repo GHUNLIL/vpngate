@@ -49,6 +49,7 @@ type Manager struct {
 	active      *Tunnel
 	standby     *Tunnel
 	lockedID    string // user-pinned node: keep this exit IP
+	closing     bool
 	activeSince time.Time
 	status      string
 	lastRefresh int64
@@ -219,6 +220,7 @@ func (m *Manager) SetLocked(locked bool) {
 
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
+	m.closing = true // from here on nothing is adopted or saved
 	tunnels := []*Tunnel{m.active, m.standby}
 	m.active, m.standby = nil, nil
 	m.mu.Unlock()
@@ -381,6 +383,14 @@ func (m *Manager) ensure(ctx context.Context) {
 	}
 	m.setStatus("正在测试节点")
 	tunnels := m.acquire(ctx)
+	if ctx.Err() != nil { // shutting down mid-test: keep the saved node, adopt nothing
+		m.mu.Lock()
+		for _, t := range tunnels {
+			m.release(t)
+		}
+		m.mu.Unlock()
+		return
+	}
 	if reselect {
 		m.reselect(ctx, tunnels)
 		return
@@ -680,8 +690,14 @@ func (m *Manager) measure(ctx context.Context, t *Tunnel) error {
 	if len(st.RTTs) == 0 { // some nodes drop ICMP: fall back to TCP handshakes
 		st, probe = m.tcpProbe(ctx, t.Dev, 3), "tcp"
 	}
+	if ctx.Err() != nil {
+		return ctx.Err() // shutting down: the samples are meaningless
+	}
 	if len(st.RTTs) == 0 {
 		return fmt.Errorf("隧道已建立但无法访问外网")
+	}
+	if loss := st.LossPct(); loss > 50 {
+		return fmt.Errorf("隧道内丢包 %.0f%%", loss)
 	}
 	var exitIP string
 	if body, err := HTTPGet(ctx, m.res, exitInfoURL, t.Dev); err == nil {
@@ -718,6 +734,10 @@ func (m *Manager) tcpProbe(ctx context.Context, dev string, count int) PingStats
 // ---------------------------------------------------------------- switching (caller holds m.mu)
 
 func (m *Manager) setActive(t *Tunnel) {
+	if m.closing {
+		m.release(t)
+		return
+	}
 	m.active = t
 	m.activeSince = time.Now()
 	log.Printf("当前节点: %s", describe(t.Node))
@@ -830,6 +850,9 @@ func (m *Manager) observe(ctx context.Context, t *Tunnel) {
 	st := PingStats{Sent: probeCount}
 	if t.Alive() {
 		st = m.probe(ctx, t, probeCount)
+	}
+	if ctx.Err() != nil {
+		return // interrupted by shutdown, not real loss
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -975,6 +998,9 @@ func (m *Manager) statePath() string { return filepath.Join(m.cfg.DataDir, "stat
 // saveState persists the pinned node and the active node (with its config) so a restart
 // reconnects to the same exit IP. Caller holds m.mu.
 func (m *Manager) saveState() {
+	if m.closing {
+		return
+	}
 	state := map[string]any{"locked_id": m.lockedID}
 	if m.active != nil {
 		state["last"] = m.active.Node

@@ -79,13 +79,15 @@ func TestSelectionRule(t *testing.T) {
 	untested := &Node{ID: "e"}
 	lossy := mk("f", 10, 200) // fastest and lowest latency, but 10% loss -> not qualified
 	lossy.Loss = ptr(10)
-	nodes := []*Node{untested, lossy, slower, slowLowLat, fastHighLat, fastLowLat}
+	worse := mk("g", 5, 300) // even lossier: among unqualified, less loss ranks first
+	worse.Loss = ptr(90)
+	nodes := []*Node{untested, worse, lossy, slower, slowLowLat, fastHighLat, fastLowLat}
 	sort.SliceStable(nodes, func(i, j int) bool { return Better(nodes[i], nodes[j], 50) })
 	var ids []string
 	for _, n := range nodes {
 		ids = append(ids, n.ID)
 	}
-	if strings.Join(ids, "") != "abfcde" {
+	if strings.Join(ids, "") != "abcdfge" {
 		t.Errorf("ranking %v, want qualified by latency, then unqualified by speed, then untested", ids)
 	}
 	if !fastLowLat.Qualified(50) || slowLowLat.Qualified(50) || untested.Qualified(0) {

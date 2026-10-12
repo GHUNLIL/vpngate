@@ -69,7 +69,8 @@ func (n *Node) Qualified(minMbps float64) bool {
 }
 
 // Better is the selection rule: tested nodes first; among them, qualified ones (speed >= minMbps,
-// loss <= 5%) win, and the lowest latency decides between them. If none qualify, the fastest wins.
+// loss <= 5%) win, and the lowest latency decides between them. If none qualify: less loss first,
+// then the fastest, then the lowest latency.
 func Better(a, b *Node, minMbps float64) bool {
 	if (a.RTT == nil) != (b.RTT == nil) {
 		return a.RTT != nil
@@ -81,8 +82,15 @@ func Better(a, b *Node, minMbps float64) bool {
 	if qa != qb {
 		return qa
 	}
-	if !qa && val(a.Mbps) != val(b.Mbps) {
-		return val(a.Mbps) > val(b.Mbps)
+	if !qa {
+		if la, lb := val(a.Loss) <= maxQualifiedLoss, val(b.Loss) <= maxQualifiedLoss; la != lb {
+			return la
+		} else if !la && val(a.Loss) != val(b.Loss) {
+			return val(a.Loss) < val(b.Loss)
+		}
+		if val(a.Mbps) != val(b.Mbps) {
+			return val(a.Mbps) > val(b.Mbps)
+		}
 	}
 	return *a.RTT < *b.RTT
 }
