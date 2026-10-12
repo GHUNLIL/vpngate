@@ -30,13 +30,13 @@ type Config struct {
 	Sources          []string
 	Countries        []string
 	ResidentialOnly  bool
-	TCPPenaltyMs     float64
 	DeepTestCount    int
 	DeepTestParallel int
 	SpeedtestBytes   int64
 	Standby          bool
-	AutoUpgrade      bool
 	Refresh          time.Duration
+	Hold             time.Duration // keep the exit IP this long, then re-select the best node
+	MinMbps          float64       // speed bar; among nodes reaching it the lowest latency wins
 
 	ProbeTarget     string
 	MonitorInterval time.Duration
@@ -62,13 +62,13 @@ func LoadConfig() (*Config, error) {
 		Sources:          list("SOURCES", "https://www.vpngate.net/api/iphone/,http://www.vpngate.net/api/iphone/"),
 		Countries:        list("COUNTRIES", "JP"),
 		ResidentialOnly:  boolEnv("RESIDENTIAL_ONLY", true),
-		TCPPenaltyMs:     float64(num("TCP_PENALTY_MS", 15, 0, 1000)),
 		DeepTestCount:    num("DEEP_TEST_COUNT", 6, 1, 30),
 		DeepTestParallel: num("DEEP_TEST_PARALLEL", 3, 1, 10),
-		SpeedtestBytes:   int64(num("SPEEDTEST_BYTES", 2_000_000, 0, 100_000_000)),
+		SpeedtestBytes:   int64(num("SPEEDTEST_BYTES", 10_000_000, 0, 100_000_000)),
 		Standby:          boolEnv("STANDBY", true),
-		AutoUpgrade:      boolEnv("AUTO_UPGRADE", false),
 		Refresh:          time.Duration(num("REFRESH_MINUTES", 30, 5, 1440)) * time.Minute,
+		Hold:             time.Duration(num("HOLD_MINUTES", 90, 5, 10080)) * time.Minute,
+		MinMbps:          float64(num("MIN_MBPS", 50, 0, 10000)),
 		ProbeTarget:      str("PROBE_TARGET", "1.1.1.1"),
 		MonitorInterval:  time.Duration(num("MONITOR_INTERVAL", 5, 1, 60)) * time.Second,
 		FailLossPct:      float64(num("FAIL_LOSS_PCT", 30, 1, 100)),

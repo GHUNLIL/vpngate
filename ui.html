@@ -39,8 +39,8 @@ pre{margin:0;max-height:260px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,mon
   <div class="card"><h2>备用节点（热备，故障时秒切）</h2><div id="standby" class="muted">无</div></div>
   <div class="card"><h2>代理</h2><div id="proxy"></div></div>
 </div>
-<div class="card table" style="margin-bottom:12px"><h2>节点（评分越低越好）</h2>
-<table><thead><tr><th>IP</th><th>类型</th><th>运营商</th><th>城市</th><th>协议</th><th>直连</th><th>隧道延迟</th><th>抖动</th><th>丢包</th><th>速度</th><th>评分</th><th>状态</th><th></th></tr></thead>
+<div class="card table" style="margin-bottom:12px"><h2 id="ruleTitle">节点</h2>
+<table><thead><tr><th>IP</th><th>类型</th><th>运营商</th><th>城市</th><th>协议</th><th>直连</th><th>隧道延迟</th><th>抖动</th><th>丢包</th><th>速度</th><th>合格</th><th>状态</th><th></th></tr></thead>
 <tbody id="nodes"></tbody></table></div>
 <div class="card"><h2>日志</h2><pre id="logs"></pre></div>
 </main>
@@ -79,7 +79,9 @@ function nodeCard(n, live) {
 function render(s) {
   state = s;
   $("ver").textContent = "v" + s.version;
-  $("status").innerHTML = esc(s.status) + (s.locked ? ' · <span class="warn">已锁定节点</span>' : "");
+  const left = s.next_reselect ? Math.max(0, Math.round((s.next_reselect * 1000 - Date.now()) / 60000)) : null;
+  $("status").innerHTML = esc(s.status) + (s.locked ? ' · <span class="warn">已锁定节点</span>' : left != null ? ` · ${left} 分钟后重选` : "");
+  $("ruleTitle").textContent = `节点（速度 ≥ ${s.min_mbps} Mbps 合格，合格中延迟最低者优先；每 ${s.hold_minutes} 分钟重选）`;
   $("lockBtn").textContent = s.locked ? "解除锁定" : "锁定当前节点";
   $("active").innerHTML = nodeCard(s.active, s.live);
   $("standby").innerHTML = nodeCard(s.standby);
@@ -98,7 +100,7 @@ function render(s) {
     return `<tr class="${n.role === "active" ? "active" : ""}"><td>${esc(n.ip)}</td><td>${KIND[n.kind]||n.kind}</td>
     <td>${esc(n.isp)}</td><td>${esc(n.city)}</td><td>${n.proto.toUpperCase()}:${n.port}</td><td>${ms(n.direct_rtt)}</td>
     <td>${ms(n.rtt)}</td><td>${ms(n.jitter)}</td><td class="${lossCls(n.loss)}">${pct(n.loss)}</td><td>${mbps(n.mbps)}</td>
-    <td>${n.score ?? "–"}</td><td>${st} <span class="err" title="${esc(n.error)}">${n.role ? "" : esc(n.error)}</span></td>
+    <td>${n.rtt == null ? "–" : n.qualified ? '<span class="ok">✓</span>' : '<span class="muted">✗</span>'}</td><td>${st} <span class="err" title="${esc(n.error)}">${n.role ? "" : esc(n.error)}</span></td>
     <td>${n.role === "active" ? "" : `<button data-id="${esc(n.id)}">切换</button>`}</td></tr>`;
   }).join("");
   const logs = $("logs"), atBottom = logs.scrollTop + logs.clientHeight >= logs.scrollHeight - 4;

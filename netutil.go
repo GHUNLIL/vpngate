@@ -335,9 +335,9 @@ func SpeedTest(ctx context.Context, r *Resolver, url, dev string) (float64, erro
 		return 0, errors.New(resp.Status)
 	}
 	start := time.Now()
-	n, err := io.Copy(io.Discard, resp.Body)
+	n, _ := io.Copy(io.Discard, resp.Body) // a timeout still leaves a usable partial measurement
 	secs := time.Since(start).Seconds()
-	if err != nil || secs <= 0 || n == 0 {
+	if secs <= 0 || n < 256<<10 {
 		return 0, errors.New("测速失败")
 	}
 	return float64(n) * 8 / secs / 1e6, nil

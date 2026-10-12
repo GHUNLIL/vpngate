@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -60,27 +59,34 @@ type Node struct {
 	FailedUntil int64    `json:"failed_until"`
 }
 
-// Score: lower is better. Latency dominates, jitter and loss weigh heavily, UDP preferred.
-func (n *Node) Score(tcpPenalty float64) float64 {
-	if n.RTT == nil {
-		return math.Inf(1)
+// Qualified reports whether the node's measured throughput reaches the bar.
+func (n *Node) Qualified(minMbps float64) bool { return n.RTT != nil && val(n.Mbps) >= minMbps }
+
+// Better is the selection rule: tested nodes first; among them, those reaching minMbps win, and
+// the lowest latency decides between qualified nodes. If none qualify, the fastest wins.
+func Better(a, b *Node, minMbps float64) bool {
+	if (a.RTT == nil) != (b.RTT == nil) {
+		return a.RTT != nil
 	}
-	s := *n.RTT + 2*val(n.Jitter) + 15*val(n.Loss) - 0.3*math.Min(val(n.Mbps), 100)
-	if n.Proto == "tcp" {
-		s += tcpPenalty
+	if a.RTT == nil {
+		return a.PrefilterKey() < b.PrefilterKey()
 	}
-	return s
+	qa, qb := a.Qualified(minMbps), b.Qualified(minMbps)
+	if qa != qb {
+		return qa
+	}
+	if !qa && val(a.Mbps) != val(b.Mbps) {
+		return val(a.Mbps) > val(b.Mbps)
+	}
+	return *a.RTT < *b.RTT
 }
 
-func (n *Node) PrefilterKey(tcpPenalty float64) float64 {
-	k := 200 + float64(n.VGPing)
+// PrefilterKey orders untested nodes by direct VPS -> node latency (stage 1).
+func (n *Node) PrefilterKey() float64 {
 	if n.DirectRTT != nil {
-		k = *n.DirectRTT
+		return *n.DirectRTT
 	}
-	if n.Proto == "tcp" {
-		k += tcpPenalty
-	}
-	return k
+	return 200 + float64(n.VGPing)
 }
 
 func (n *Node) Failed(now time.Time) bool { return n.FailedUntil > now.Unix() }

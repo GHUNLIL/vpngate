@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -72,15 +71,24 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-func TestScoreRanking(t *testing.T) {
-	mk := func(proto string, rtt, loss float64) *Node {
-		return &Node{Proto: proto, RTT: ptr(rtt), Jitter: ptr(1), Loss: ptr(loss)}
+func TestSelectionRule(t *testing.T) {
+	mk := func(id string, rtt, mbps float64) *Node { return &Node{ID: id, RTT: ptr(rtt), Mbps: ptr(mbps)} }
+	fastLowLat := mk("a", 30, 60)   // qualified, lowest latency -> wins
+	fastHighLat := mk("b", 45, 150) // qualified, faster but slower latency
+	slowLowLat := mk("c", 20, 40)   // lowest latency but below 50 Mbps
+	slower := mk("d", 25, 10)
+	untested := &Node{ID: "e"}
+	nodes := []*Node{untested, slower, slowLowLat, fastHighLat, fastLowLat}
+	sort.SliceStable(nodes, func(i, j int) bool { return Better(nodes[i], nodes[j], 50) })
+	var ids []string
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
 	}
-	fastUDP, fastTCP, lossy, untested := mk("udp", 20, 0), mk("tcp", 20, 0), mk("udp", 15, 10), &Node{Proto: "udp"}
-	nodes := []*Node{untested, lossy, fastTCP, fastUDP}
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Score(15) < nodes[j].Score(15) })
-	if nodes[0] != fastUDP || nodes[1] != fastTCP || nodes[2] != lossy || !math.IsInf(nodes[3].Score(15), 1) {
-		t.Errorf("unexpected ranking")
+	if strings.Join(ids, "") != "abcde" {
+		t.Errorf("ranking %v, want qualified by latency, then unqualified by speed, then untested", ids)
+	}
+	if !fastLowLat.Qualified(50) || slowLowLat.Qualified(50) || untested.Qualified(0) {
+		t.Error("qualification")
 	}
 }
 
