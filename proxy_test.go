@@ -303,8 +303,27 @@ func TestWebLockoutAndCSRF(t *testing.T) {
 	}
 }
 
+func TestPoolTransport(t *testing.T) {
+	_, m := newWeb(t)
+	m.nodes["c"] = &Node{ID: "c", IP: "9.9.9.9", Proto: "tcp", Kind: "residential"}
+	pool := m.pool()
+	if len(pool) != 1 || pool[0].ID != "a" {
+		t.Errorf("TRANSPORT=udp must keep only UDP nodes, got %d", len(pool))
+	}
+	m.nodes["a"].FailedUntil = time.Now().Add(time.Hour).Unix()
+	if pool := m.pool(); len(pool) != 1 || pool[0].ID != "c" {
+		t.Error("with no UDP node left, TCP is the fallback")
+	}
+	m.cfg.Transport = "auto"
+	m.nodes["a"].FailedUntil = 0
+	if len(m.pool()) != 2 {
+		t.Error("auto takes both")
+	}
+}
+
 func TestPoolResidentialFallback(t *testing.T) {
 	_, m := newWeb(t)
+	m.cfg.Transport = "auto"
 	if pool := m.pool(); len(pool) != 1 || pool[0].ID != "a" {
 		t.Errorf("want only residential node, got %d", len(pool))
 	}

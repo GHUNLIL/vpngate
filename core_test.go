@@ -78,13 +78,15 @@ func TestSelectionRule(t *testing.T) {
 	slowLowLat := mk("c", 20, 40)   // lowest latency but below 50 Mbps
 	slower := mk("d", 25, 10)
 	untested := &Node{ID: "e"}
-	nodes := []*Node{untested, slower, slowLowLat, fastHighLat, fastLowLat}
+	lossy := mk("f", 10, 200) // fastest and lowest latency, but 10% loss -> not qualified
+	lossy.Loss = ptr(10)
+	nodes := []*Node{untested, lossy, slower, slowLowLat, fastHighLat, fastLowLat}
 	sort.SliceStable(nodes, func(i, j int) bool { return Better(nodes[i], nodes[j], 50) })
 	var ids []string
 	for _, n := range nodes {
 		ids = append(ids, n.ID)
 	}
-	if strings.Join(ids, "") != "abcde" {
+	if strings.Join(ids, "") != "abfcde" {
 		t.Errorf("ranking %v, want qualified by latency, then unqualified by speed, then untested", ids)
 	}
 	if !fastLowLat.Qualified(50) || slowLowLat.Qualified(50) || untested.Qualified(0) {
@@ -160,6 +162,30 @@ func TestPushedOptionWarningIsNotFatal(t *testing.T) {
 	}
 }
 
+func TestNativeUDPVariants(t *testing.T) {
+	html := []byte(`<a href='do_openvpn.aspx?fqdn=a.opengw.net&amp;ip=1.2.3.4&amp;tcp=1605&amp;udp=1915&amp;sid=1'>` +
+		`<a href='do_openvpn.aspx?fqdn=b.opengw.net&ip=5.6.7.8&tcp=443&udp=0&sid=2'>`)
+	ports := ParseUDPPorts(html)
+	if len(ports) != 1 || ports["1.2.3.4"] != 1915 {
+		t.Fatalf("ports %v", ports)
+	}
+	tcp := &Node{ID: "1.2.3.4-tcp1605", IP: "1.2.3.4", Port: 1605, Proto: "tcp", Kind: "residential",
+		Config: "client\nproto tcp\nremote 1.2.3.4 1605\n<ca>x</ca>\n"}
+	other := &Node{ID: "5.6.7.8-tcp443", IP: "5.6.7.8", Port: 443, Proto: "tcp"}
+	out := WithUDP([]*Node{tcp, other}, ports)
+	if len(out) != 3 {
+		t.Fatalf("want one UDP variant added, got %d nodes", len(out))
+	}
+	u := out[2]
+	if u.ID != "1.2.3.4-udp1915" || u.Proto != "udp" || u.Port != 1915 || u.Kind != "residential" ||
+		!strings.Contains(u.Config, "proto udp\nremote 1.2.3.4 1915\n<ca>") || tcp.Proto != "tcp" {
+		t.Errorf("bad variant %+v\n%s", u, u.Config)
+	}
+	if len(WithUDP(out, ports)) != 3 {
+		t.Error("variants must not be duplicated")
+	}
+}
+
 func TestPickCandidatesKeepsUDP(t *testing.T) {
 	var sorted []*Node
 	for i := 0; i < 8; i++ {
@@ -200,6 +226,9 @@ func TestConfig(t *testing.T) {
 	c, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if c.Transport != "udp" {
+		t.Errorf("default transport %q", c.Transport)
 	}
 	if c.WebPort != 54345 || c.ProxyPort != 7928 || c.Countries[0] != "JP" || !c.ResidentialOnly || !c.Standby {
 		t.Errorf("unexpected defaults %+v", c)

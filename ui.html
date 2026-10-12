@@ -86,7 +86,7 @@ function render(s) {
   $("ver").textContent = "v" + s.version;
   const left = s.next_reselect ? Math.max(0, Math.round((s.next_reselect * 1000 - Date.now()) / 60000)) : null;
   $("status").innerHTML = esc(s.status) + (s.locked ? ' · <span class="warn">已锁定节点</span>' : left != null ? ` · ${left} 分钟后重选` : "");
-  $("ruleTitle").textContent = `节点（速度 ≥ ${s.min_mbps} Mbps 合格，合格中延迟最低者优先；每 ${s.hold_minutes} 分钟重选）`;
+  $("ruleTitle").textContent = `节点（速度 ≥ ${s.min_mbps} Mbps 且丢包 ≤ 5% 合格，合格中延迟最低者优先；每 ${s.hold_minutes} 分钟重选）`;
   $("lockBtn").textContent = s.locked ? "解除锁定" : "锁定当前节点";
   $("active").innerHTML = nodeCard(s.active, s.live);
   $("standby").innerHTML = nodeCard(s.standby);

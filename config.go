@@ -33,6 +33,7 @@ type Config struct {
 	SSMethod   string
 
 	Sources          []string
+	Transport        string // udp (native UDP only, TCP as last resort) | tcp | auto
 	Countries        []string
 	ResidentialOnly  bool
 	DeepTestCount    int
@@ -69,6 +70,7 @@ func LoadConfig() (*Config, error) {
 		SSMethod:         str("SS_METHOD", "aes-128-gcm"),
 		Sources:          list("SOURCES", "https://www.vpngate.net/api/iphone/,http://www.vpngate.net/api/iphone/"),
 		Countries:        list("COUNTRIES", "JP"),
+		Transport:        strings.ToLower(str("TRANSPORT", "udp")),
 		ResidentialOnly:  boolEnv("RESIDENTIAL_ONLY", true),
 		DeepTestCount:    num("DEEP_TEST_COUNT", 6, 1, 30),
 		DeepTestParallel: num("DEEP_TEST_PARALLEL", 3, 1, 10),
@@ -104,6 +106,9 @@ func LoadConfig() (*Config, error) {
 	}
 	if c.WebPort == c.ProxyPort || c.SSPassword != "" && (c.SSPort == c.WebPort || c.SSPort == c.ProxyPort) {
 		return nil, fmt.Errorf("WEB_PORT、PROXY_PORT、SS_PORT 不能相同")
+	}
+	if c.Transport != "udp" && c.Transport != "tcp" && c.Transport != "auto" {
+		return nil, fmt.Errorf("TRANSPORT 只能是 udp / tcp / auto")
 	}
 	if net.ParseIP(c.ProbeTarget).To4() == nil {
 		return nil, fmt.Errorf("PROBE_TARGET 必须是 IPv4 地址")

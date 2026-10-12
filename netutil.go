@@ -42,6 +42,30 @@ func TCPRTT(ctx context.Context, ip string, port int, dev string, timeout time.D
 	return &rtt
 }
 
+// OpenVPNUDPRTT sends an OpenVPN P_CONTROL_HARD_RESET_CLIENT_V2 and times the server's reset reply:
+// a cheap reachability + latency probe for UDP nodes, which mostly drop ICMP.
+func OpenVPNUDPRTT(ip string, port int, timeout time.Duration) *float64 {
+	c, err := net.DialTimeout("udp4", net.JoinHostPort(ip, strconv.Itoa(port)), timeout)
+	if err != nil {
+		return nil
+	}
+	defer c.Close()
+	pkt := make([]byte, 14) // opcode|key-id, session id (8), ack count (0), packet id (4)
+	pkt[0] = 7 << 3
+	_, _ = rand.Read(pkt[1:9])
+	start := time.Now()
+	if _, err := c.Write(pkt); err != nil {
+		return nil
+	}
+	_ = c.SetReadDeadline(start.Add(timeout))
+	buf := make([]byte, 1500)
+	n, err := c.Read(buf)
+	if err != nil || n < 1 || buf[0]>>3 != 8 { // P_CONTROL_HARD_RESET_SERVER_V2
+		return nil
+	}
+	return ptr(float64(time.Since(start).Microseconds()) / 1000)
+}
+
 // ---------------------------------------------------------------- ICMP
 
 type PingStats struct {

@@ -101,7 +101,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		_ = json.Unmarshal(data, &state)
 	}
 	m.lockedID = state.LockedID
-	if state.Last != nil && state.Last.Config != "" {
+	if state.Last != nil && state.Last.Config != "" && m.transportOK(state.Last) {
 		m.nodes[state.Last.ID] = state.Last
 		log.Printf("尝试恢复上次使用的节点 %s (保持出口 IP 不变)", state.Last.IP)
 		if t := m.evaluate(ctx, state.Last, false); t != nil {
@@ -230,13 +230,16 @@ func (m *Manager) refresh(ctx context.Context) error {
 		return err
 	}
 	fresh := ParseCSV(data, m.cfg.Countries)
+	if m.cfg.Transport != "tcp" {
+		fresh = WithUDP(fresh, FetchUDPPorts(ctx, filepath.Join(m.cfg.DataDir, "udp_ports.json")))
+	}
 	ClassifyNodes(ctx, fresh, filepath.Join(m.cfg.DataDir, "ipinfo.json"))
 
 	m.mu.Lock()
 	merged := make(map[string]*Node, len(fresh))
 	kinds := map[string]int{}
 	for _, n := range fresh {
-		kinds[n.Kind]++
+		kinds[n.Kind+"/"+n.Proto]++
 		if old := m.nodes[n.ID]; old != nil { // keep measurements across refreshes
 			n.HandshakeMs, n.RTT, n.Jitter, n.Loss, n.Mbps = old.HandshakeMs, old.RTT, old.Jitter, old.Loss, old.Mbps
 			n.ExitIP, n.TestedAt, n.Error, n.FailedUntil = old.ExitIP, old.TestedAt, old.Error, old.FailedUntil
@@ -281,21 +284,37 @@ func (m *Manager) pool() []*Node {
 			home = append(home, n)
 		}
 	}
+	nodes := home
 	if !m.cfg.ResidentialOnly {
-		return all
-	}
-	if len(home) == 0 && len(all) > 0 {
+		nodes = all
+	} else if len(home) == 0 && len(all) > 0 {
 		log.Printf("没有可用的家宽节点，临时使用其他类型节点")
-		return all
+		nodes = all
 	}
-	return home
+	var native []*Node
+	for _, n := range nodes {
+		if m.transportOK(n) {
+			native = append(native, n)
+		}
+	}
+	if len(native) == 0 && len(nodes) > 0 {
+		log.Printf("没有可用的 %s 节点，临时使用其他协议", strings.ToUpper(m.cfg.Transport))
+		return nodes
+	}
+	return native
+}
+
+// transportOK reports whether n uses the configured transport (TRANSPORT=udp / tcp; auto takes both).
+func (m *Manager) transportOK(n *Node) bool {
+	return m.cfg.Transport == "auto" || n.Proto == m.cfg.Transport
 }
 
 func (m *Manager) inUse(n *Node) bool {
 	return m.active != nil && m.active.Node == n || m.standby != nil && m.standby.Node == n
 }
 
-// prefilter is stage 1: direct RTT from the VPS to every candidate (TCP connect or ICMP).
+// prefilter is stage 1: direct RTT from the VPS to every candidate (TCP connect, or an OpenVPN
+// handshake probe for UDP).
 func (m *Manager) prefilter(ctx context.Context, nodes []*Node) {
 	type result struct {
 		rtt *float64
@@ -319,14 +338,12 @@ func (m *Manager) prefilter(ctx context.Context, nodes []*Node) {
 				results[i] = result{a, a != nil}
 				return
 			}
-			st := Ping(ctx, ip, 3, 100*time.Millisecond, time.Second, "")
-			var best *float64
-			for _, r := range st.RTTs {
-				if best == nil || r < *best {
-					best = ptr(r)
-				}
+			a := OpenVPNUDPRTT(ip, port, 1500*time.Millisecond)
+			b := OpenVPNUDPRTT(ip, port, 1500*time.Millisecond)
+			if a == nil || b != nil && *b < *a {
+				a = b
 			}
-			results[i] = result{best, true} // many home routers drop ICMP: keep UDP nodes anyway
+			results[i] = result{a, a != nil}
 		}(i, n.IP, n.Port, n.Proto)
 	}
 	wg.Wait()
@@ -348,7 +365,9 @@ func (m *Manager) ensure(ctx context.Context) {
 	m.mu.RLock()
 	needActive := m.active == nil || !m.active.Alive()
 	needStandby := m.cfg.Standby && (m.standby == nil || !m.standby.Alive())
-	reselect := !needActive && m.lockedID == "" && time.Since(m.activeSince) >= m.cfg.Hold
+	// A node on the wrong transport (e.g. TCP after switching to TRANSPORT=udp) is replaced right away.
+	reselect := !needActive && m.lockedID == "" &&
+		(time.Since(m.activeSince) >= m.cfg.Hold || !m.transportOK(m.active.Node))
 	m.mu.RUnlock()
 	if !needActive && !needStandby && !reselect {
 		return
@@ -401,6 +420,9 @@ func (m *Manager) reselect(ctx context.Context, fresh []*Tunnel) {
 	m.mu.RUnlock()
 	all := append([]*Tunnel(nil), fresh...)
 	for _, t := range incumbents {
+		if len(fresh) > 0 && !m.transportOK(t.Node) {
+			continue // replaced by a node on the configured transport
+		}
 		if m.measure(ctx, t, true) == nil {
 			all = append(all, t)
 		}
@@ -605,7 +627,7 @@ func (m *Manager) evaluate(ctx context.Context, n *Node, speedtest bool) *Tunnel
 }
 
 func (m *Manager) measure(ctx context.Context, t *Tunnel, speedtest bool) error {
-	st := Ping(ctx, m.cfg.ProbeTarget, 10, 100*time.Millisecond, time.Second, t.Dev)
+	st := Ping(ctx, m.cfg.ProbeTarget, 20, 100*time.Millisecond, time.Second, t.Dev)
 	probe := "icmp"
 	if len(st.RTTs) == 0 { // some nodes drop ICMP: fall back to TCP handshakes
 		st, probe = m.tcpProbe(ctx, t.Dev, 3), "tcp"

@@ -59,11 +59,16 @@ type Node struct {
 	FailedUntil int64    `json:"failed_until"`
 }
 
-// Qualified reports whether the node's measured throughput reaches the bar.
-func (n *Node) Qualified(minMbps float64) bool { return n.RTT != nil && val(n.Mbps) >= minMbps }
+// maxQualifiedLoss is the packet loss (%) above which a node never qualifies, however fast.
+const maxQualifiedLoss = 5
 
-// Better is the selection rule: tested nodes first; among them, those reaching minMbps win, and
-// the lowest latency decides between qualified nodes. If none qualify, the fastest wins.
+// Qualified reports whether the node reaches the speed bar without losing packets.
+func (n *Node) Qualified(minMbps float64) bool {
+	return n.RTT != nil && val(n.Mbps) >= minMbps && val(n.Loss) <= maxQualifiedLoss
+}
+
+// Better is the selection rule: tested nodes first; among them, qualified ones (speed >= minMbps,
+// loss <= 5%) win, and the lowest latency decides between them. If none qualify, the fastest wins.
 func Better(a, b *Node, minMbps float64) bool {
 	if (a.RTT == nil) != (b.RTT == nil) {
 		return a.RTT != nil
@@ -206,6 +211,76 @@ func ParseCSV(data []byte, countries []string) []*Node {
 		})
 	}
 	return nodes
+}
+
+// ---------------------------------------------------------------- native UDP
+
+const vpngateSiteURL = "https://www.vpngate.net/en/"
+
+var (
+	sitePortRE = regexp.MustCompile(`do_openvpn\.aspx\?fqdn=[^&'"]*&(?:amp;)?ip=([\d.]+)&(?:amp;)?tcp=(\d+)&(?:amp;)?udp=(\d+)`)
+	protoRE    = regexp.MustCompile(`(?m)^proto\s.*$`)
+	remoteRE   = regexp.MustCompile(`(?m)^remote\s.*$`)
+)
+
+// ParseUDPPorts extracts each server's OpenVPN UDP port from the vpngate.net server list page.
+func ParseUDPPorts(html []byte) map[string]int {
+	ports := map[string]int{}
+	for _, m := range sitePortRE.FindAllSubmatch(html, -1) {
+		if p, _ := strconv.Atoi(string(m[3])); p > 0 && p < 65536 {
+			ports[string(m[1])] = p
+		}
+	}
+	return ports
+}
+
+// FetchUDPPorts reads the UDP ports the API does not publish (it ships one, mostly TCP, config per
+// server). The last good result is cached so a failed fetch keeps the known ports.
+func FetchUDPPorts(ctx context.Context, cacheFile string) map[string]int {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, vpngateSiteURL, nil)
+	req.Header.Set("User-Agent", userAgent)
+	if resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req); err == nil {
+		html, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		if ports := ParseUDPPorts(html); len(ports) > 0 {
+			if data, err := json.Marshal(ports); err == nil {
+				_ = os.WriteFile(cacheFile, data, 0o600)
+			}
+			return ports
+		}
+	} else {
+		log.Printf("读取节点 UDP 端口失败: %v", err)
+	}
+	ports := map[string]int{}
+	if data, err := os.ReadFile(cacheFile); err == nil {
+		_ = json.Unmarshal(data, &ports)
+	}
+	return ports
+}
+
+// WithUDP adds a native-UDP variant of every TCP node whose server advertises a UDP port.
+func WithUDP(nodes []*Node, ports map[string]int) []*Node {
+	seen := map[string]bool{}
+	for _, n := range nodes {
+		seen[n.ID] = true
+	}
+	out := nodes
+	for _, n := range nodes {
+		port := ports[n.IP]
+		if n.Proto != "tcp" || port == 0 {
+			continue
+		}
+		u := *n
+		u.Proto, u.Port = "udp", port
+		u.ID = fmt.Sprintf("%s-udp%d", n.IP, port)
+		u.Config = remoteRE.ReplaceAllLiteralString(protoRE.ReplaceAllLiteralString(n.Config, "proto udp"),
+			fmt.Sprintf("remote %s %d", n.IP, port))
+		if !seen[u.ID] {
+			seen[u.ID] = true
+			out = append(out, &u)
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------- classification
