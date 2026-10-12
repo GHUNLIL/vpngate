@@ -137,7 +137,8 @@ func TestIsPublicIP(t *testing.T) {
 func TestOpenVPNArgs(t *testing.T) {
 	udp := strings.Join(OpenVPNArgs("/c.ovpn", "/a", "vg3", "udp", [2]int{2, 6}), " ")
 	for _, want := range []string{"--dev vg3", "--route-nopull", "--fast-io", "--sndbuf 4194304", "--mssfix 1360",
-		"--data-ciphers AES-128-GCM", "--data-ciphers-fallback AES-128-CBC", "--ping-exit 25"} {
+		"--data-ciphers AES-128-GCM", "--data-ciphers-fallback AES-128-CBC", "--ping-exit 25",
+		"--explicit-exit-notify 1", "--tun-mtu 1400"} {
 		if !strings.Contains(udp, want) {
 			t.Errorf("missing %q", want)
 		}
@@ -146,7 +147,8 @@ func TestOpenVPNArgs(t *testing.T) {
 		t.Error("CLI options must come after --config to override the file")
 	}
 	tcp := strings.Join(OpenVPNArgs("/c", "/a", "vg0", "tcp", [2]int{2, 4}), " ")
-	if strings.Contains(tcp, "--fast-io") || strings.Contains(tcp, "--data-ciphers") {
+	if strings.Contains(tcp, "--fast-io") || strings.Contains(tcp, "--data-ciphers") ||
+		strings.Contains(tcp, "--explicit-exit-notify") {
 		t.Error("tcp / OpenVPN 2.4 must not get UDP or NCP options")
 	}
 }

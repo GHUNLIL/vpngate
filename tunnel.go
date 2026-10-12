@@ -89,7 +89,10 @@ func OpenVPNArgs(conf, auth, dev, proto string, version [2]int) []string {
 			"--data-ciphers-fallback", "AES-128-CBC")
 	}
 	if proto == "udp" {
-		args = append(args, "--fast-io", "--sndbuf", "4194304", "--rcvbuf", "4194304")
+		args = append(args, "--fast-io", "--sndbuf", "4194304", "--rcvbuf", "4194304",
+			// Tell the server we're leaving so it frees the session now; otherwise a reconnect right
+			// after a restart is refused (AUTH_FAILED) while the old session lingers.
+			"--explicit-exit-notify", "1")
 	}
 	if st, err := os.Stat("/etc/ssl/certs"); err == nil && st.IsDir() {
 		args = append(args, "--capath", "/etc/ssl/certs")
