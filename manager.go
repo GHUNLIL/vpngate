@@ -606,7 +606,8 @@ func (m *Manager) evaluate(ctx context.Context, n *Node, speedtest bool) *Tunnel
 	m.mu.Unlock()
 
 	t := NewTunnel(n, slot, m.cfg.RunDir())
-	hs, err := t.Start(ctx, m.cfg.OpenVPN, m.auth, m.version, 25*time.Second)
+	// A healthy handshake takes ~1.3 s over UDP and ~2.5 s over TCP; don't let dead nodes stall recovery.
+	hs, err := t.Start(ctx, m.cfg.OpenVPN, m.auth, m.version, 10*time.Second)
 	if err == nil {
 		m.mu.Lock()
 		n.HandshakeMs = ptr(hs)

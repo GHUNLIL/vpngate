@@ -223,6 +223,7 @@ func TestResolverServesStaleInstantly(t *testing.T) {
 
 func TestConfig(t *testing.T) {
 	t.Setenv("WEB_PASS", "x")
+	t.Setenv("SS_PASSWORD", "y")
 	c, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -230,17 +231,17 @@ func TestConfig(t *testing.T) {
 	if c.Transport != "udp" {
 		t.Errorf("default transport %q", c.Transport)
 	}
-	if c.WebPort != 54345 || c.ProxyPort != 7928 || c.Countries[0] != "JP" || !c.ResidentialOnly || !c.Standby {
+	if c.WebPort != 54345 || c.SSPort != 7929 || c.Countries[0] != "JP" || !c.ResidentialOnly || !c.Standby {
 		t.Errorf("unexpected defaults %+v", c)
 	}
-	t.Setenv("PROXY_ALLOW", "203.0.113.0/24, 198.51.100.7")
+	t.Setenv("SS_ALLOW", "203.0.113.0/24, 198.51.100.7")
 	t.Setenv("COUNTRIES", "jp,kr")
 	t.Setenv("WEB_PORT", "99999")
 	c, err = LoadConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.ProxyAllow) != 2 || c.Countries[1] != "KR" || c.WebPort != 65535 {
+	if len(c.SSAllow) != 2 || c.Countries[1] != "KR" || c.WebPort != 65535 {
 		t.Errorf("env parsing: %+v", c)
 	}
 	t.Setenv("WEB_PASS", "")

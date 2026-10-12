@@ -19,18 +19,13 @@ type Config struct {
 	WebUser string
 	WebPass string
 
-	ProxyHost     string
-	ProxyPort     int
-	ProxyUser     string
-	ProxyPass     string
-	ProxyAllow    []*net.IPNet
-	ProxyMaxConns int
-	FastConnect   bool
-
-	// Shadowsocks: encrypted TCP + UDP entry (disabled when SS_PASSWORD is empty)
+	// Shadowsocks: the single client entry, encrypted, TCP + UDP on one port
+	SSHost     string
 	SSPort     int
 	SSPassword string
 	SSMethod   string
+	SSAllow    []*net.IPNet // allowed client sources; empty = everyone
+	SSMaxConns int
 
 	Sources          []string
 	Transport        string // udp (native UDP only, TCP as last resort) | tcp | auto
@@ -59,15 +54,11 @@ func LoadConfig() (*Config, error) {
 		WebPort:          num("WEB_PORT", 54345, 1, 65535),
 		WebUser:          str("WEB_USER", "admin"),
 		WebPass:          str("WEB_PASS", ""),
-		ProxyHost:        str("PROXY_HOST", "0.0.0.0"),
-		ProxyPort:        num("PROXY_PORT", 7928, 1, 65535),
-		ProxyUser:        str("PROXY_USER", ""),
-		ProxyPass:        str("PROXY_PASS", ""),
-		ProxyMaxConns:    num("PROXY_MAX_CONNS", 8192, 16, 1<<20),
-		FastConnect:      boolEnv("FAST_CONNECT", true),
+		SSHost:           str("SS_HOST", "0.0.0.0"),
 		SSPort:           num("SS_PORT", 7929, 1, 65535),
 		SSPassword:       str("SS_PASSWORD", ""),
 		SSMethod:         str("SS_METHOD", "aes-128-gcm"),
+		SSMaxConns:       num("SS_MAX_CONNS", 8192, 16, 1<<20),
 		Sources:          list("SOURCES", "https://www.vpngate.net/api/iphone/,http://www.vpngate.net/api/iphone/"),
 		Countries:        list("COUNTRIES", "JP"),
 		Transport:        strings.ToLower(str("TRANSPORT", "udp")),
@@ -87,7 +78,7 @@ func LoadConfig() (*Config, error) {
 	for i, cc := range c.Countries {
 		c.Countries[i] = strings.ToUpper(cc)
 	}
-	for _, item := range list("PROXY_ALLOW", "") {
+	for _, item := range list("SS_ALLOW", "") {
 		if !strings.Contains(item, "/") {
 			if strings.Contains(item, ":") {
 				item += "/128"
@@ -97,15 +88,18 @@ func LoadConfig() (*Config, error) {
 		}
 		_, network, err := net.ParseCIDR(item)
 		if err != nil {
-			return nil, fmt.Errorf("PROXY_ALLOW 格式错误 %q: %v", item, err)
+			return nil, fmt.Errorf("SS_ALLOW 格式错误 %q: %v", item, err)
 		}
-		c.ProxyAllow = append(c.ProxyAllow, network)
+		c.SSAllow = append(c.SSAllow, network)
 	}
 	if c.WebPass == "" {
 		return nil, fmt.Errorf("WEB_PASS 未设置，拒绝以空密码启动管理后台")
 	}
-	if c.WebPort == c.ProxyPort || c.SSPassword != "" && (c.SSPort == c.WebPort || c.SSPort == c.ProxyPort) {
-		return nil, fmt.Errorf("WEB_PORT、PROXY_PORT、SS_PORT 不能相同")
+	if c.SSPassword == "" {
+		return nil, fmt.Errorf("SS_PASSWORD 未设置")
+	}
+	if c.WebPort == c.SSPort {
+		return nil, fmt.Errorf("WEB_PORT 与 SS_PORT 不能相同")
 	}
 	if c.Transport != "udp" && c.Transport != "tcp" && c.Transport != "auto" {
 		return nil, fmt.Errorf("TRANSPORT 只能是 udp / tcp / auto")

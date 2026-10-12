@@ -138,32 +138,20 @@ func run() error {
 	defer stop()
 
 	m := NewManager(cfg)
-	p := &Proxy{Addr: net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort)), User: cfg.ProxyUser,
-		Pass: cfg.ProxyPass, Allow: cfg.ProxyAllow, MaxConns: int64(cfg.ProxyMaxConns), FastConnect: cfg.FastConnect,
-		Dial: TunnelDialer(m.res, m.Route)}
-	if err := p.Listen(); err != nil {
+	c, err := newSSCipher(cfg.SSMethod, cfg.SSPassword)
+	if err != nil {
 		return err
 	}
-	defer p.Close()
-	go func() { _ = p.Serve() }()
-
-	var ss *SSServer
-	if cfg.SSPassword != "" {
-		c, err := newSSCipher(cfg.SSMethod, cfg.SSPassword)
-		if err != nil {
-			return err
-		}
-		ss = &SSServer{Addr: net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.SSPort)), Cipher: c,
-			Allow: func(ip net.IP) bool { return sourceAllowed(cfg.ProxyAllow, ip) },
-			Dial:  TunnelDialer(m.res, m.Route), Res: m.res, Route: m.Route}
-		if err := ss.Listen(); err != nil {
-			return err
-		}
-		defer ss.Close()
-		go ss.Serve()
+	ss := &SSServer{Addr: net.JoinHostPort(cfg.SSHost, strconv.Itoa(cfg.SSPort)), Cipher: c,
+		Allow:    func(ip net.IP) bool { return sourceAllowed(cfg.SSAllow, ip) },
+		MaxConns: int64(cfg.SSMaxConns), Dial: TunnelDialer(m.res, m.Route), Res: m.res, Route: m.Route}
+	if err := ss.Listen(); err != nil {
+		return err
 	}
+	defer ss.Close()
+	go ss.Serve()
 
-	web := NewWebUI(cfg, m, p, ss, ring)
+	web := NewWebUI(cfg, m, ss, ring)
 	webAddr := net.JoinHostPort(cfg.WebHost, strconv.Itoa(cfg.WebPort))
 	errc := make(chan error, 1)
 	go func() { errc <- web.Serve(ctx, webAddr) }()
@@ -205,8 +193,6 @@ func install() error {
 	}
 	if _, err := os.Stat(envPath); os.IsNotExist(err) {
 		env := setEnv(envTemplate, "WEB_PASS", randomString(20))
-		env = setEnv(env, "PROXY_USER", "u"+randomString(7))
-		env = setEnv(env, "PROXY_PASS", randomString(20))
 		env = setEnv(env, "SS_PASSWORD", randomString(24))
 		if err := os.WriteFile(envPath, []byte(env), 0o600); err != nil {
 			return err
@@ -257,32 +243,22 @@ func info() error {
 		return err
 	}
 	ip := publicIP()
-	user, pass, port := env["PROXY_USER"], env["PROXY_PASS"], env["PROXY_PORT"]
+	pass, method := env["SS_PASSWORD"], env["SS_METHOD"]
+	if method == "" {
+		method = "aes-128-gcm"
+	}
+	port, _ := strconv.Atoi(env["SS_PORT"])
 	state, _ := exec.Command("systemctl", "is-active", "vpngate").Output()
 	fmt.Printf(`
-  管理后台  http://%s:%s/
-  后台账号  %s / %s
+  管理后台  http://%s:%s/   账号 %s / %s
 
-  SOCKS5   socks5h://%s:%s@%s:%s
-  HTTP     http://%s:%s@%s:%s
-
-  经专线中转时，把 %s:%s 换成专线入口地址。
-  服务状态  %s
-`, ip, env["WEB_PORT"], env["WEB_USER"], env["WEB_PASS"], user, pass, ip, port, user, pass, ip, port, ip, port,
-		strings.TrimSpace(string(state)))
-	if sp := env["SS_PASSWORD"]; sp != "" {
-		method := env["SS_METHOD"]
-		if method == "" {
-			method = "aes-128-gcm"
-		}
-		ssPort, _ := strconv.Atoi(env["SS_PORT"])
-		fmt.Printf(`
-  Shadowsocks (加密, 支持 UDP)
+  Shadowsocks (TCP + UDP)
   链接     %s
-  Clash:
-    - {name: 日本家宽, type: ss, server: %s, port: %d, cipher: %s, password: "%s", udp: true}
-`, SSURI(method, sp, ip, ssPort, "VPNGATE"), ip, ssPort, method, sp)
-	}
+  Clash    - {name: 日本家宽, type: ss, server: %s, port: %d, cipher: %s, password: "%s", udp: true}
+
+  服务状态  %s
+`, ip, env["WEB_PORT"], env["WEB_USER"], env["WEB_PASS"], SSURI(method, pass, ip, port, "VPNGATE"),
+		ip, port, method, pass, strings.TrimSpace(string(state)))
 	return nil
 }
 
@@ -292,7 +268,6 @@ func passwd() error {
 		return err
 	}
 	env := setEnv(string(data), "WEB_PASS", randomString(20))
-	env = setEnv(env, "PROXY_PASS", randomString(20))
 	env = setEnv(env, "SS_PASSWORD", randomString(24))
 	if err := os.WriteFile(envPath, []byte(env), 0o600); err != nil {
 		return err

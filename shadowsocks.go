@@ -26,12 +26,50 @@ import (
 )
 
 const (
+	handshakeTimeout = 15 * time.Second
+	halfCloseTimeout = 30 * time.Second
+
 	ssMaxPayload   = 0x3FFF
 	ssTagSize      = 16
 	ssUDPIdle      = 2 * time.Minute
 	ssMaxAssocs    = 4096
-	ssReplayWindow = 1 << 17 // salts remembered for replay protection
+	ssReplayWindow = 1 << 15 // salts remembered for replay protection
 )
+
+// Dial opens an upstream TCP connection for host:port.
+type Dial func(ctx context.Context, host string, port int) (net.Conn, error)
+
+var errNoTunnel = errors.New("没有可用的隧道")
+
+// TunnelDialer connects through whichever tunnel is currently active.
+func TunnelDialer(res *Resolver, route func() string) Dial {
+	return func(ctx context.Context, host string, port int) (net.Conn, error) {
+		dev := route()
+		if dev == "" {
+			return nil, errNoTunnel
+		}
+		return DialVia(ctx, res, host, port, dev, 10*time.Second)
+	}
+}
+
+// sourceAllowed applies the SS_ALLOW list (empty = everyone); loopback is always allowed.
+func sourceAllowed(allow []*net.IPNet, ip net.IP) bool {
+	if len(allow) == 0 {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, n := range allow {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
 
 // ---------------------------------------------------------------- crypto
 
@@ -255,7 +293,7 @@ type saltFilter struct {
 }
 
 func newSaltFilter(size int) *saltFilter {
-	return &saltFilter{seen: make(map[string]struct{}, size), ring: make([]string, size)}
+	return &saltFilter{seen: map[string]struct{}{}, ring: make([]string, size)} // map grows with use
 }
 
 // add records a salt; false means it was seen before (a replayed handshake).
@@ -278,12 +316,15 @@ func (f *saltFilter) add(salt []byte) bool {
 // ---------------------------------------------------------------- server
 
 type SSServer struct {
-	Addr   string
-	Cipher *ssCipher
-	Allow  func(net.IP) bool
-	Dial   Dial
-	Res    *Resolver
-	Route  func() string
+	Addr     string
+	Cipher   *ssCipher
+	Allow    func(net.IP) bool
+	MaxConns int64
+	Dial     Dial
+	Res      *Resolver
+	Route    func() string
+
+	Active atomic.Int64 // open TCP connections (for SS_MAX_CONNS)
 
 	allowPrivate bool                                     // tests only: permit loopback UDP targets
 	listenUDP    func(dev string) (net.PacketConn, error) // tests only: replaces the device-bound socket
@@ -292,7 +333,6 @@ type SSServer struct {
 	pc           *net.UDPConn
 	mu           sync.Mutex
 	assocs       map[netip.AddrPort]*udpAssoc
-	Active       atomic.Int64
 }
 
 func (s *SSServer) Listen() error {
@@ -328,7 +368,8 @@ func (s *SSServer) Serve() {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		if tcp, ok := c.RemoteAddr().(*net.TCPAddr); !ok || !s.Allow(tcp.IP) {
+		if tcp, ok := c.RemoteAddr().(*net.TCPAddr); !ok || !s.Allow(tcp.IP) ||
+			s.MaxConns > 0 && s.Active.Load() >= s.MaxConns {
 			c.Close()
 			continue
 		}
@@ -384,7 +425,7 @@ func (s *SSServer) handleTCP(c net.Conn) {
 	}
 
 	done := make(chan error, 2)
-	go func() { // client -> target: whatever was decrypted ahead is drained first by io.Copy
+	go func() { // client -> target
 		_, err := io.Copy(up, r)
 		if tc, ok := up.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()

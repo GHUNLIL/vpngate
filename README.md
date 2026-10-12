@@ -1,21 +1,21 @@
 # VPNGATE
 
-日本家宽出口网关：在日本 VPS 上自动挑选延迟最低、丢包最少的 VPNGate **日本家宽**节点，对外提供 HTTP / HTTPS / SOCKS5 代理（同一端口），以及加密、支持 UDP 的 Shadowsocks 入口。配合沪日专线，得到“专线低延迟 + 日本住宅 IP 出口”。
+日本家宽出口网关：在日本 VPS 上自动挑选延迟最低的 VPNGate **日本家宽**节点，通过原生 UDP 隧道连接；客户端用 **Shadowsocks** 接入（加密，TCP + UDP）。配合沪日专线，得到“专线低延迟 + 日本住宅 IP 出口”。
 
 - **单个静态二进制**（约 7 MB，Go 标准库，零依赖），系统只需 `openvpn` 和 `iproute2`
-- **零拷贝转发**：握手后两端都是 TCP 套接字，Linux 上走 `splice(2)`，数据不经过用户态
+- **一个入口**：Shadowsocks（`aes-128-gcm`）同一端口承载 TCP 和 UDP，游戏、语音、QUIC 都能走；带重放保护，错误密码和探测请求得不到任何响应
 - **原生 UDP 隧道**：VPNGate API 只下发 TCP 配置，程序从 vpngate.net 读出每个节点的 UDP 端口，改走原生 UDP。实测比 TCP 延迟低 5–10ms，抖动从 15–20ms 降到 1–2ms
 - **只选家宽**：按 ip-api.com 的归属信息排除机房、移动网络和筑波大学学术节点
 - **两阶段测速**：先对全部节点测 VPS 直连延迟，再对前 N 名建立真实隧道，测隧道内延迟、抖动、丢包和下载速度
 - **热备秒切**：第二条隧道常驻待命，主节点故障时新连接立即走备用隧道，不用重新握手
-- **新连接更快**：`FAST_CONNECT` 先回复“连接成功”，再并行连接上游。DNS 结果缓存 30 分钟，过了 2 分钟就在后台刷新，同一个域名再次访问不用等 DNS
-- **出口 IP 稳定**：选中的节点保持 90 分钟，到期后再按“速度 ≥ 50 Mbps、延迟最低”重选；重启后优先连回上次的节点；手动锁定的节点故障恢复后自动切回
+- **DNS 走日本**：域名通过隧道解析，CDN 按日本出口调度；结果缓存 30 分钟，过了 2 分钟就在后台刷新，同一个域名再次访问不用等 DNS
+- **出口 IP 稳定**：选中的节点保持 90 分钟，到期后再按“速度 ≥ 50 Mbps 且丢包 ≤ 5%、延迟最低”重选；重启后优先连回上次的节点；手动锁定的节点故障恢复后自动切回
 - **不动 VPS 自身路由**：每条隧道独立网卡（`vgN`）+ 独立路由表 + `oif` 策略规则，SSH 不受影响
 
 ```
-客户端 ──沪日专线──▶ 日本 VPS :7928 ──(vg0 隧道)──▶ VPNGate 日本家宽节点 ──▶ 目标网站
-                         │
-                         └──(vg1 热备隧道)──▶ 另一个家宽节点
+客户端 ──Shadowsocks (TCP+UDP)──▶ 日本 VPS :7929 ──(vg0 UDP 隧道)──▶ VPNGate 日本家宽节点 ──▶ 目标网站
+                                       │
+                                       └──(vg1 热备隧道)──▶ 另一个家宽节点
 ```
 
 ## 安装
@@ -28,44 +28,39 @@ bash <(curl -fsSL https://raw.githubusercontent.com/GHUNLIL/vpngate/main/install
 
 离线安装：把 `vpngate-linux-amd64`（或对应架构）和 `install.sh` 放在同一目录，执行 `bash install.sh`。
 
-安装完成后会打印后台地址、账号和代理连接串，之后随时可用 `vpngate info` 查看。
+安装完成后会打印后台地址和 Shadowsocks 连接信息，之后随时可用 `vpngate info` 查看。
 
 ## 连接
 
 | 项目 | 默认值 |
 | --- | --- |
+| Shadowsocks | `VPS:7929`（TCP + UDP），`aes-128-gcm` |
 | 管理后台 | `http://VPS:54345/`（HTTP Basic 认证，连续失败 10 次锁定 10 分钟） |
-| 代理 | `VPS:7928`，HTTP / HTTPS CONNECT / SOCKS5 共用，需要账号密码，仅 TCP |
-| Shadowsocks | `VPS:7929`（TCP + UDP），`aes-128-gcm`，加密，**支持 UDP**（游戏、语音、QUIC） |
 
-需要 UDP 或者想让客户端到服务器这段加密，就用 Shadowsocks。`vpngate info` 会打印 `ss://` 链接和 Clash 配置，后台页面也能直接复制：
+`vpngate info` 会打印 `ss://` 链接和 Clash 配置，后台页面也能直接复制。Clash / Mihomo 写法：
 
 ```yaml
 proxies:
   - {name: 日本家宽, type: ss, server: VPS地址, port: 7929, cipher: aes-128-gcm, password: "密码", udp: true}
 ```
 
-UDP 同样从日本家宽出口出去。主节点故障切换或定时重选后，正在进行的 UDP 会话会自动迁到新的隧道上。
-
-**延迟最低的用法**：客户端优先用 **HTTP 代理**（HTTPS 走 CONNECT）。带账号密码的 SOCKS5 在发出数据前要经专线来回 3 次，HTTP CONNECT 只要 1 次。如果设置了 `PROXY_ALLOW` 白名单，还可以把 `PROXY_USER` 和 `PROXY_PASS` 留空，免去认证。
-
-用 SOCKS5 时请用 **`socks5h://`**（由网关解析域名）。域名通过隧道交给日本 DNS 解析，CDN 会按日本出口调度。用 `socks5://` 时，域名会在国内本地解析，可能被调度到非日本的 CDN 节点。
+Shadowrocket、Surge、v2rayN 等客户端直接导入 `ss://` 链接即可，记得打开 UDP。主节点故障切换或定时重选后，正在进行的 UDP 会话会自动迁到新的隧道上。
 
 ### 配合沪日专线
 
-1. 专线入口（上海）转发到 `日本 VPS IP:7928`。
-2. 在 `/etc/vpngate/vpngate.env` 里设置 `PROXY_ALLOW=专线落地机IP/32`，只允许专线来源访问代理。
-3. 客户端连接 `socks5h://用户:密码@专线入口:端口`。
+1. 专线入口（上海）转发到 `日本 VPS IP:7929`，TCP 和 UDP 都要转发。
+2. 在 `/etc/vpngate/vpngate.env` 里设置 `SS_ALLOW=专线落地机IP/32`，只允许专线来源连接。
+3. 客户端把 Shadowsocks 服务器地址填成专线入口地址和端口。
 
 ## 命令
 
 ```
-vpngate info       后台地址、账号和代理连接串
+vpngate info       后台地址、账号和 Shadowsocks 连接信息
 vpngate status     服务状态
 vpngate logs       实时日志
 vpngate restart    重启 (start / stop 同理)
 vpngate config     编辑配置并重启
-vpngate passwd     重新生成后台和代理密码
+vpngate passwd     重新生成后台和 Shadowsocks 密码
 vpngate update     从 GitHub Release 更新
 vpngate uninstall  卸载
 ```
@@ -77,10 +72,8 @@ vpngate uninstall  卸载
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `WEB_PORT` | `54345` | 管理后台端口 |
-| `PROXY_PORT` | `7928` | 代理端口 |
-| `PROXY_ALLOW` | 空 | 允许访问代理的来源 IP/CIDR，逗号分隔 |
-| `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | `7929` / 随机 / `aes-128-gcm` | Shadowsocks 入口，密码留空则关闭；可选 `aes-256-gcm` |
-| `FAST_CONNECT` | `1` | 先回复“连接成功”再连上游，每个新连接省一次隧道往返 |
+| `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | `7929` / 随机 / `aes-128-gcm` | Shadowsocks 入口；可选 `aes-256-gcm` |
+| `SS_ALLOW` | 空 | 允许连接的来源 IP/CIDR，逗号分隔；留空不限制 |
 | `COUNTRIES` | `JP` | 节点国家 |
 | `TRANSPORT` | `udp` | 隧道协议：`udp` 只用原生 UDP（没有可用 UDP 节点时才退回 TCP），`tcp`，或 `auto` 两者一起比 |
 | `RESIDENTIAL_ONLY` | `1` | 只用家宽节点（没有可用家宽时临时放宽） |

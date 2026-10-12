@@ -24,7 +24,6 @@ const (
 type WebUI struct {
 	cfg     *Config
 	manager *Manager
-	proxy   *Proxy
 	ss      *SSServer
 	logs    *LogRing
 
@@ -37,8 +36,8 @@ type failure struct {
 	first time.Time
 }
 
-func NewWebUI(cfg *Config, m *Manager, p *Proxy, ss *SSServer, logs *LogRing) *WebUI {
-	return &WebUI{cfg: cfg, manager: m, proxy: p, ss: ss, logs: logs, failures: map[string]failure{}}
+func NewWebUI(cfg *Config, m *Manager, ss *SSServer, logs *LogRing) *WebUI {
+	return &WebUI{cfg: cfg, manager: m, ss: ss, logs: logs, failures: map[string]failure{}}
 }
 
 func (w *WebUI) Handler() http.Handler {
@@ -154,15 +153,8 @@ func (w *WebUI) action(fn func(*http.Request, map[string]any) error) http.Handle
 func (w *WebUI) status() map[string]any {
 	s := w.manager.Snapshot()
 	s["version"] = version
-	s["proxy"] = map[string]any{
-		"port": w.cfg.ProxyPort, "user": w.proxy.User, "password": w.proxy.Pass,
-		"active": w.proxy.Active.Load(), "total": w.proxy.Total.Load(),
-		"bytes_up": w.proxy.BytesUp.Load(), "bytes_down": w.proxy.BytesDn.Load(),
-	}
-	if w.ss != nil {
-		s["ss"] = map[string]any{"port": w.cfg.SSPort, "method": w.cfg.SSMethod, "password": w.cfg.SSPassword,
-			"active": w.ss.Active.Load()}
-	}
+	s["ss"] = map[string]any{"port": w.cfg.SSPort, "method": w.cfg.SSMethod, "password": w.cfg.SSPassword,
+		"active": w.ss.Active.Load()}
 	s["logs"] = w.logs.Lines()
 	return s
 }
