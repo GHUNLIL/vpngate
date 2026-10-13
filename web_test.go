@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +111,59 @@ func TestPoolResidentialFallback(t *testing.T) {
 	m.nodes["a"].Kind = "hosting"
 	if pool := m.pool(); len(pool) != 2 {
 		t.Errorf("want fallback to all nodes, got %d", len(pool))
+	}
+}
+
+func TestRotationNoRepeat(t *testing.T) {
+	t.Setenv("ROTATE_NO_REPEAT", "1")
+	t.Setenv("HOLD_MINUTES", "2")
+	_, m := newWeb(t)
+	if !m.cfg.NoRepeat || m.cfg.Hold != 2*time.Minute {
+		t.Fatalf("config: no_repeat=%v hold=%v", m.cfg.NoRepeat, m.cfg.Hold)
+	}
+	m.nodes["c"] = &Node{ID: "c", IP: "9.9.9.9", Proto: "udp", Kind: "residential", ExitIP: "9.9.9.10"}
+	tun := func(id string) *Tunnel { return &Tunnel{Node: m.nodes[id], exited: make(chan struct{})} }
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.setActive(tun("a"), "start")
+	if pool := m.pool(); len(pool) != 1 || pool[0].ID != "c" {
+		t.Fatalf("after using a, only c may be picked, got %d", len(pool))
+	}
+	m.setActive(tun("c"), "rotate")
+	if len(m.pool()) != 0 {
+		t.Fatal("a is used and c is active: nothing left this round")
+	}
+	if !m.used["9.9.9.10"] {
+		t.Error("the exit IP must be recorded too")
+	}
+	m.resetUsed()
+	if pool := m.pool(); len(pool) != 1 || pool[0].ID != "a" {
+		t.Errorf("after reset a is available again, got %d", len(pool))
+	}
+	if !m.isUsed(m.nodes["c"]) {
+		t.Error("the current exit IP stays recorded after a reset")
+	}
+	data, _ := os.ReadFile(m.statePath())
+	if !strings.Contains(string(data), `"used":["9.9.9.10","9.9.9.9"]`) {
+		t.Errorf("used IPs must survive a restart, state: %s", data)
+	}
+}
+
+func TestConnectTestRanking(t *testing.T) {
+	// a pings faster, but b answers real requests faster: with a connect test b wins
+	a := &Node{RTT: ptr(20.0), Loss: ptr(0.0), ConnMs: ptr(400.0)}
+	b := &Node{RTT: ptr(30.0), Loss: ptr(0.0), ConnMs: ptr(150.0)}
+	if !Better(b, a, 0) || Better(a, b, 0) {
+		t.Error("connect-test time must decide between qualified nodes")
+	}
+	a.ConnMs, b.ConnMs = nil, nil
+	if !Better(a, b, 0) {
+		t.Error("without a connect test ping RTT decides")
+	}
+	b.ConnMs, b.Loss = ptr(100.0), ptr(33.3) // one of three real requests failed
+	if !Better(a, b, 0) {
+		t.Error("failed real requests count as loss and disqualify")
 	}
 }
 

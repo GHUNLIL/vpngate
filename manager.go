@@ -9,6 +9,10 @@ package main
 // Selection rule (Better): speed >= MIN_MBPS qualifies, then lowest latency wins. The active node is
 // kept for HOLD_MINUTES so the exit IP is stable, then everything is re-measured and re-ranked.
 // Failures never wait for the hold: they fail over to the standby immediately.
+//
+// Rotation mode (ROTATE_NO_REPEAT=1): every hold period moves to an exit IP that has not been used
+// yet. Used IPs are left out of the candidates until every node is either used or failing; then the
+// record is cleared and the rotation starts over.
 
 import (
 	"context"
@@ -61,13 +65,14 @@ type Manager struct {
 	status      string
 	lastRefresh int64
 	slots       []int
+	used        map[string]bool // rotation mode: node / exit IPs already used this round
 
 	selectMu sync.Mutex // serialises selection / switching
 	wake     chan struct{}
 }
 
 func NewManager(cfg *Config) *Manager {
-	m := &Manager{cfg: cfg, res: NewResolver(cfg.DNSServers), nodes: map[string]*Node{},
+	m := &Manager{cfg: cfg, res: NewResolver(cfg.DNSServers), nodes: map[string]*Node{}, used: map[string]bool{},
 		notify: &Notifier{WebhookURL: cfg.NotifyWebhook, TGToken: cfg.TGBotToken, TGChatID: cfg.TGChatID},
 		status: "启动中", wake: make(chan struct{}, 1), auth: filepath.Join(cfg.DataDir, "auth.txt")}
 	for i := 0; i < maxSlots; i++ {
@@ -105,16 +110,22 @@ func (m *Manager) Start(ctx context.Context) error {
 	CleanupStale(m.cfg.RunDir())
 
 	var state struct {
-		LockedID    string `json:"locked_id"`
-		Last        *Node  `json:"last"`
-		ActiveSince int64  `json:"active_since"`
-		ExitIP      string `json:"exit_ip"`
+		LockedID    string   `json:"locked_id"`
+		Last        *Node    `json:"last"`
+		ActiveSince int64    `json:"active_since"`
+		ExitIP      string   `json:"exit_ip"`
+		Used        []string `json:"used"`
 	}
 	if data, err := os.ReadFile(m.statePath()); err == nil {
 		_ = json.Unmarshal(data, &state)
 	}
 	m.lockedID = state.LockedID
 	m.exitIP = state.ExitIP
+	if m.cfg.NoRepeat {
+		for _, ip := range state.Used {
+			m.used[ip] = true
+		}
+	}
 	if state.Last != nil && state.Last.Config != "" && m.transportOK(state.Last) {
 		m.nodes[state.Last.ID] = state.Last
 		log.Printf("尝试恢复上次使用的节点 %s (保持出口 IP 不变)", state.Last.IP)
@@ -139,7 +150,10 @@ func (m *Manager) Run(ctx context.Context) {
 		default:
 		}
 		// The list (~1.3 MB) is only fetched when a selection is due, or when it is getting old.
-		if m.selectionDue() || time.Since(time.Unix(m.lastRefreshed(), 0)) > listMaxAge {
+		// Rotation reselects every few minutes, so there it is fetched at most every REFRESH_MINUTES.
+		age := time.Since(time.Unix(m.lastRefreshed(), 0))
+		due := m.selectionDue() && (!m.cfg.NoRepeat || age > m.cfg.Refresh || !m.hasActive())
+		if due || age > listMaxAge {
 			if err := m.refresh(ctx); err != nil {
 				log.Printf("刷新节点列表失败: %v", err)
 			}
@@ -185,6 +199,12 @@ func (m *Manager) selectionDue() bool {
 		return true
 	}
 	return m.lockedID == "" && (time.Since(m.activeSince) >= m.cfg.Hold || !m.transportOK(m.active.Node))
+}
+
+func (m *Manager) hasActive() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.active != nil && m.active.Alive()
 }
 
 func (m *Manager) lastRefreshed() int64 {
@@ -284,6 +304,7 @@ func (m *Manager) refresh(ctx context.Context) error {
 		kinds[n.Kind+"/"+n.Proto]++
 		if old := m.nodes[n.ID]; old != nil { // keep measurements across refreshes
 			n.HandshakeMs, n.RTT, n.Jitter, n.Loss, n.Mbps = old.HandshakeMs, old.RTT, old.Jitter, old.Loss, old.Mbps
+			n.ConnMs = old.ConnMs
 			n.ExitIP, n.TestedAt, n.Error, n.FailedUntil = old.ExitIP, old.TestedAt, old.Error, old.FailedUntil
 		}
 		merged[n.ID] = n
@@ -313,8 +334,24 @@ func (m *Manager) refresh(ctx context.Context) error {
 	return nil
 }
 
-// pool returns usable candidates (caller holds m.mu).
+// pool returns usable candidates (caller holds m.mu). In rotation mode used nodes still count when
+// deciding whether to fall back to other node types or protocols, and are only left out at the end:
+// running out of fresh residential IPs starts a new round instead of falling back.
 func (m *Manager) pool() []*Node {
+	nodes := m.eligible()
+	if !m.cfg.NoRepeat {
+		return nodes
+	}
+	var fresh []*Node
+	for _, n := range nodes {
+		if !m.isUsed(n) {
+			fresh = append(fresh, n)
+		}
+	}
+	return fresh
+}
+
+func (m *Manager) eligible() []*Node {
 	now := time.Now()
 	var all, home []*Node
 	for _, n := range m.nodes {
@@ -353,6 +390,33 @@ func (m *Manager) transportOK(n *Node) bool {
 
 func (m *Manager) inUse(n *Node) bool {
 	return m.active != nil && m.active.Node == n || m.standby != nil && m.standby.Node == n
+}
+
+// isUsed reports whether rotation has already used this node's IP or exit IP (caller holds m.mu).
+func (m *Manager) isUsed(n *Node) bool {
+	return m.used[n.IP] || n.ExitIP != "" && m.used[n.ExitIP]
+}
+
+// markUsed records the node for rotation (caller holds m.mu).
+func (m *Manager) markUsed(n *Node) {
+	if !m.cfg.NoRepeat {
+		return
+	}
+	m.used[n.IP] = true
+	if n.ExitIP != "" {
+		m.used[n.ExitIP] = true
+	}
+}
+
+// resetUsed starts a new rotation round once every node is used or failing. The current active
+// stays recorded so the next pick is still a different IP (caller holds m.mu).
+func (m *Manager) resetUsed() {
+	log.Printf("所有节点都已轮换过或不可用 (已用 %d 个 IP)，清空记录重新轮换", len(m.used))
+	m.used = map[string]bool{}
+	if m.active != nil {
+		m.markUsed(m.active.Node)
+	}
+	m.saveState()
 }
 
 // prefilter is stage 1: direct RTT from the VPS to every candidate (TCP connect, or an OpenVPN
@@ -463,9 +527,11 @@ func (m *Manager) ensure(ctx context.Context) {
 func (m *Manager) reselect(ctx context.Context, fresh []*Tunnel) {
 	m.mu.RLock()
 	var incumbents []*Tunnel
+	used := map[*Tunnel]bool{}
 	for _, t := range []*Tunnel{m.active, m.standby} {
 		if t != nil && t.Alive() {
 			incumbents = append(incumbents, t)
+			used[t] = m.cfg.NoRepeat && m.isUsed(t.Node)
 		}
 	}
 	m.mu.RUnlock()
@@ -473,6 +539,9 @@ func (m *Manager) reselect(ctx context.Context, fresh []*Tunnel) {
 	for _, t := range incumbents {
 		if len(fresh) > 0 && !m.transportOK(t.Node) {
 			continue // replaced by a node on the configured transport
+		}
+		if used[t] {
+			continue // rotation: the current exit IP never wins again this round
 		}
 		if m.measure(ctx, t) == nil {
 			all = append(all, t)
@@ -505,8 +574,9 @@ func (m *Manager) reselect(ctx context.Context, fresh []*Tunnel) {
 		}
 	}
 	if best == nil {
-		log.Printf("定时重选: 没有可用节点，保持现状，10 分钟后重试")
-		m.activeSince = time.Now().Add(10*time.Minute - m.cfg.Hold)
+		retry := min(10*time.Minute, m.cfg.Hold)
+		log.Printf("定时重选: 没有可用节点，保持现状，%d 分钟后重试", int(retry.Minutes()))
+		m.activeSince = time.Now().Add(retry - m.cfg.Hold)
 		return
 	}
 	old := m.active
@@ -528,6 +598,9 @@ func (m *Manager) reselect(ctx context.Context, fresh []*Tunnel) {
 		log.Printf("定时重选: 当前节点仍是最优，保持出口 IP %s", best.Node.IP)
 		m.activeSince = time.Now()
 		m.saveState()
+	} else if m.cfg.NoRepeat {
+		log.Printf("定时轮换: 切换到未用过的出口 IP (本轮已用 %d 个)", len(m.used))
+		m.setActive(best, fmt.Sprintf("%d 分钟定时轮换", int(m.cfg.Hold.Minutes())))
 	} else {
 		log.Printf("定时重选: 切换到更优节点")
 		m.setActive(best, fmt.Sprintf("%d 分钟定时重选", int(m.cfg.Hold.Minutes())))
@@ -578,10 +651,14 @@ func (m *Manager) restoreLocked(ctx context.Context) {
 
 // acquire is stage 2: deep-test the top candidates in parallel; returns working tunnels, best first.
 func (m *Manager) acquire(ctx context.Context) []*Tunnel {
-	m.mu.RLock()
+	m.mu.Lock()
 	cands := m.pool()
+	if len(cands) == 0 && m.cfg.NoRepeat && len(m.used) > 0 {
+		m.resetUsed()
+		cands = m.pool()
+	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].PrefilterKey() < cands[j].PrefilterKey() })
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	if len(cands) > m.cfg.DeepTestCount {
 		cands = cands[:m.cfg.DeepTestCount]
 	}
@@ -634,7 +711,7 @@ func (m *Manager) rankWithSpeed(ctx context.Context, ts []*Tunnel) {
 		if la, lb := val(a.Loss) <= maxQualifiedLoss, val(b.Loss) <= maxQualifiedLoss; la != lb {
 			return la
 		}
-		return val(a.RTT) < val(b.RTT)
+		return a.Latency() < b.Latency()
 	})
 	m.mu.Unlock()
 	found := 0
@@ -742,17 +819,50 @@ func (m *Manager) measure(ctx context.Context, t *Tunnel) error {
 			exitIP = info.Query
 		}
 	}
+	connMs, connLoss, err := m.connectTest(ctx, t)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	n := t.Node
 	t.Probe = probe
 	n.MTU = mtu
-	n.RTT, n.Jitter, n.Loss = st.Avg(), ptr(st.Jitter()), ptr(st.LossPct())
+	n.RTT, n.Jitter, n.Loss = st.Avg(), ptr(st.Jitter()), ptr(max(st.LossPct(), connLoss))
+	n.ConnMs = connMs
 	n.TestedAt = time.Now().Unix()
 	if exitIP != "" {
 		n.ExitIP = exitIP
 	}
 	return nil
+}
+
+// connectTest makes CONNECT_TEST_COUNT real requests to CONNECT_TEST_URL through the tunnel. A node
+// none of them get through is unusable; failed attempts count as loss, and the median request time
+// becomes the latency used for ranking. Off (nil, 0) when no URL is set.
+func (m *Manager) connectTest(ctx context.Context, t *Tunnel) (*float64, float64, error) {
+	url, count := m.cfg.ConnectTestURL, m.cfg.ConnectTestCount
+	if url == "" {
+		return nil, 0, nil
+	}
+	var times []float64
+	var lastErr error
+	for i := 0; i < count; i++ {
+		ms, err := ConnectTest(ctx, m.res, url, t.Dev, 6*time.Second)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		times = append(times, ms)
+	}
+	if ctx.Err() != nil {
+		return nil, 0, ctx.Err()
+	}
+	if len(times) == 0 {
+		return nil, 0, fmt.Errorf("真连接测试失败: %v", lastErr)
+	}
+	sort.Float64s(times)
+	return ptr(times[len(times)/2]), 100 * float64(count-len(times)) / float64(count), nil
 }
 
 func (m *Manager) tcpProbe(ctx context.Context, dev string, count int) PingStats {
@@ -774,6 +884,7 @@ func (m *Manager) setActive(t *Tunnel, reason string) {
 	}
 	m.active = t
 	m.activeSince = time.Now()
+	m.markUsed(t.Node)
 	log.Printf("当前节点: %s", describe(t.Node))
 	m.announce(t.Node, reason)
 	m.saveState()
@@ -793,7 +904,7 @@ func (m *Manager) announce(n *Node, reason string) {
 		m.down = false
 		m.notify.Send(Event{Event: "recovered", OldIP: old, NewIP: ip, Reason: reason, Node: node,
 			Text: fmt.Sprintf("已恢复，出口 IP %s (%s)", ip, n.ISP)})
-	case old != "" && old != ip:
+	case old != "" && old != ip && !m.cfg.NoRepeat: // in rotation mode IP changes are the point, not news
 		m.notify.Send(Event{Event: "exit_ip_changed", OldIP: old, NewIP: ip, Reason: reason, Node: node,
 			Text: fmt.Sprintf("出口 IP 变更 %s → %s，原因: %s (%s)", old, ip, reason, n.ISP)})
 	}
@@ -1072,6 +1183,7 @@ func (m *Manager) Snapshot() map[string]any {
 		"status": m.status, "locked": m.lockedID != "", "locked_id": m.lockedID,
 		"residential_only": m.cfg.ResidentialOnly, "min_mbps": minMbps,
 		"hold_minutes": int(m.cfg.Hold.Minutes()), "next_reselect": nextReselect,
+		"rotate_no_repeat": m.cfg.NoRepeat, "used_count": len(m.used),
 		"last_refresh": m.lastRefresh,
 		"active":       view(m.active), "standby": view(m.standby),
 		"nodes": list,
@@ -1087,6 +1199,14 @@ func (m *Manager) saveState() {
 		return
 	}
 	state := map[string]any{"locked_id": m.lockedID}
+	if len(m.used) > 0 {
+		used := make([]string, 0, len(m.used))
+		for ip := range m.used {
+			used = append(used, ip)
+		}
+		sort.Strings(used)
+		state["used"] = used
+	}
 	if m.active != nil {
 		state["last"] = m.active.Node
 		state["active_since"] = m.activeSince.Unix()
@@ -1104,8 +1224,11 @@ func (m *Manager) saveState() {
 
 func describe(n *Node) string {
 	speed := ""
+	if n.ConnMs != nil {
+		speed = fmt.Sprintf(" 真连接 %.0fms", *n.ConnMs)
+	}
 	if n.Mbps != nil {
-		speed = fmt.Sprintf(" %.0fMbps", *n.Mbps)
+		speed += fmt.Sprintf(" %.0fMbps", *n.Mbps)
 	}
 	isp := n.ISP
 	if isp == "" {

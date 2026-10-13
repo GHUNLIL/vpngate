@@ -39,6 +39,10 @@ type Config struct {
 	Refresh          time.Duration
 	Hold             time.Duration // keep the exit IP this long, then re-select the best node
 	MinMbps          float64       // speed bar; among nodes reaching it the lowest latency wins
+	NoRepeat         bool          // rotation mode: every hold moves to an exit IP not used before
+
+	ConnectTestURL   string // real request through each candidate tunnel; empty = off
+	ConnectTestCount int
 
 	ProbeTarget     string
 	MonitorInterval time.Duration
@@ -73,8 +77,11 @@ func LoadConfig() (*Config, error) {
 		SpeedtestBytes:   int64(num("SPEEDTEST_BYTES", 4_000_000, 0, 100_000_000)),
 		Standby:          boolEnv("STANDBY", true),
 		Refresh:          time.Duration(num("REFRESH_MINUTES", 30, 5, 1440)) * time.Minute,
-		Hold:             time.Duration(num("HOLD_MINUTES", 90, 5, 10080)) * time.Minute,
+		Hold:             time.Duration(num("HOLD_MINUTES", 90, 1, 10080)) * time.Minute,
 		MinMbps:          float64(num("MIN_MBPS", 50, 0, 10000)),
+		NoRepeat:         boolEnv("ROTATE_NO_REPEAT", false),
+		ConnectTestURL:   str("CONNECT_TEST_URL", ""),
+		ConnectTestCount: num("CONNECT_TEST_COUNT", 3, 1, 10),
 		ProbeTarget:      str("PROBE_TARGET", "1.1.1.1"),
 		MonitorInterval:  time.Duration(num("MONITOR_INTERVAL", 2, 1, 60)) * time.Second,
 		FailLossPct:      float64(num("FAIL_LOSS_PCT", 5, 1, 100)),
@@ -104,6 +111,9 @@ func LoadConfig() (*Config, error) {
 	}
 	if c.Transport != "udp" && c.Transport != "tcp" && c.Transport != "auto" {
 		return nil, fmt.Errorf("TRANSPORT 只能是 udp / tcp / auto")
+	}
+	if u := c.ConnectTestURL; u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return nil, fmt.Errorf("CONNECT_TEST_URL 必须以 http:// 或 https:// 开头")
 	}
 	if net.ParseIP(c.ProbeTarget).To4() == nil {
 		return nil, fmt.Errorf("PROBE_TARGET 必须是 IPv4 地址")

@@ -348,6 +348,25 @@ func HTTPGet(ctx context.Context, r *Resolver, url, dev string) ([]byte, error) 
 	return io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 }
 
+// ConnectTest is a real request through dev, like a proxy client's "real delay" test: the TCP and
+// TLS handshakes and an HTTP response all have to work, not just an open port. Returns the whole
+// request time in ms.
+func ConnectTest(ctx context.Context, r *Resolver, url, dev string, timeout time.Duration) (float64, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Set("User-Agent", userAgent)
+	start := time.Now()
+	resp, err := httpClient(r, dev, timeout).Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode >= 400 {
+		return 0, errors.New(resp.Status)
+	}
+	return float64(time.Since(start).Microseconds()) / 1000, nil
+}
+
 // SpeedTest downloads through dev and returns Mbps timed only after the first warm bytes, so TCP
 // slow start doesn't drag the figure down and the download can stay small.
 func SpeedTest(ctx context.Context, r *Resolver, url, dev string, warm int64) (float64, error) {

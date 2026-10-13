@@ -52,6 +52,7 @@ type Node struct {
 	RTT         *float64 `json:"rtt"` // stage 2: through the tunnel
 	Jitter      *float64 `json:"jitter"`
 	Loss        *float64 `json:"loss"`
+	ConnMs      *float64 `json:"conn_ms"` // real request through the tunnel (CONNECT_TEST_URL)
 	Mbps        *float64 `json:"mbps"`
 	ExitIP      string   `json:"exit_ip"`
 	MTU         int      `json:"mtu"` // largest inner packet the path carries (probed)
@@ -92,7 +93,15 @@ func Better(a, b *Node, minMbps float64) bool {
 			return val(a.Mbps) > val(b.Mbps)
 		}
 	}
-	return *a.RTT < *b.RTT
+	return a.Latency() < b.Latency()
+}
+
+// Latency is what ranking compares: the real-request time when a connect test ran, else ping RTT.
+func (n *Node) Latency() float64 {
+	if n.ConnMs != nil {
+		return *n.ConnMs
+	}
+	return val(n.RTT)
 }
 
 // PrefilterKey orders untested nodes by direct VPS -> node latency (stage 1).
