@@ -32,7 +32,7 @@ else
 fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)
+SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd || true)
 BIN=''
 for f in "$SRC_DIR/vpngate-linux-$ARCH" "$SRC_DIR/dist/vpngate-linux-$ARCH"; do
  if [ -f "$f" ]; then BIN=$f; break; fi
