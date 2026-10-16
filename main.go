@@ -69,6 +69,12 @@ func main() {
 		if err = shell(editor, envPath); err == nil {
 			err = shell("systemctl", "restart", "vpngate")
 		}
+	case "profile":
+		if len(os.Args) != 3 {
+			err = fmt.Errorf("用法: vpngate profile balanced|low-bandwidth")
+		} else {
+			err = selectProfile(os.Args[2])
+		}
 	case "update":
 		err = shell("bash", "-c", fmt.Sprintf("curl -fsSL https://raw.githubusercontent.com/%s/main/install.sh | bash", repo))
 	case "status", "start", "stop", "restart":
@@ -85,6 +91,7 @@ func main() {
   config     编辑配置并重启    passwd   重新生成后台和代理密码
   update     从 GitHub 更新    uninstall 卸载
   run        前台运行 (systemd 使用)
+  profile    应用 balanced / low-bandwidth 预设
   version    版本
 `)
 	}
@@ -192,7 +199,11 @@ func install() error {
 		}
 	}
 	if _, err := os.Stat(envPath); os.IsNotExist(err) {
-		env := setEnv(envTemplate, "WEB_PASS", randomString(20))
+		env, err := profileConfig(envTemplate, str("VPNGATE_PROFILE", "balanced"))
+		if err != nil {
+			return err
+		}
+		env = setEnv(env, "WEB_PASS", randomString(20))
 		env = setEnv(env, "SS_PASSWORD", randomString(24))
 		if err := os.WriteFile(envPath, []byte(env), 0o600); err != nil {
 			return err
@@ -200,6 +211,22 @@ func install() error {
 		fmt.Println("已生成配置", envPath)
 	} else {
 		fmt.Println("保留现有配置", envPath)
+		if name := os.Getenv("VPNGATE_PROFILE"); name != "" {
+			data, err := os.ReadFile(envPath)
+			if err != nil {
+				return err
+			}
+			updated, err := profileConfig(string(data), name)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(envPath+".before-profile", data, 0o600); err != nil {
+				return err
+			}
+			if err := os.WriteFile(envPath, []byte(updated), 0o600); err != nil {
+				return err
+			}
+		}
 	}
 	_ = exec.Command("modprobe", "tcp_bbr").Run()
 	if err := os.WriteFile(sysctl, []byte(sysctlFile), 0o644); err != nil {

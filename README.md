@@ -23,12 +23,35 @@
 需要：systemd Linux（Debian / Ubuntu / RHEL 系）、root、VPS 已开启 TUN/TAP。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/GHUNLIL/vpngate/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/GHUNLIL/vpngate/main/install.sh | sudo bash
+```
+
+安装器自动选择架构、锁定同一个 Release 并验证 SHA256，生成随机后台及代理密码；重复安装保留现有配置。指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GHUNLIL/vpngate/main/install.sh | sudo env VPNGATE_VERSION=v2.4.1 bash
 ```
 
 离线安装：把 `vpngate-linux-amd64`（或对应架构）和 `install.sh` 放在同一目录，执行 `bash install.sh`。
 
 安装完成后会打印后台地址和 Shadowsocks 连接信息，之后随时可用 `vpngate info` 查看。
+
+## 两套运行预设
+
+同一个程序包含稳定出口、热备切换、出口不重复轮换、真实连接测试和通知功能。按机器带宽选择参数，不需要安装不同分支。
+
+| 预设 | 适用场景 | 默认策略 |
+| --- | --- | --- |
+| `balanced` | 普通或较大带宽 VPS | 4 MB 下载测速、50 Mbps 门槛、保持出口 90 分钟 |
+| `low-bandwidth` | 几 Mbps 的小带宽 VPS | 关闭下载测速、3 次 HTTPS 真连接测试、2 分钟不重复轮换 |
+
+首次指定低带宽预设：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/GHUNLIL/vpngate/main/install.sh | sudo env VPNGATE_PROFILE=low-bandwidth bash
+```
+
+安装后切换：`sudo vpngate profile balanced` 或 `sudo vpngate profile low-bandwidth`。只修改选点和轮换参数，保留账号、密码、端口和来源白名单。普通升级不指定预设时，保留全部现有配置。
 
 ## 连接
 
@@ -98,9 +121,9 @@ vpngate uninstall  卸载
 出口 IP 变化（90 分钟重选、故障切换、手动切换、重启后没能连回原节点）、完全没有可用节点、恢复时，会发通知到 Webhook 和/或 Telegram。Webhook 收到的 JSON：
 
 ```json
-{"event": "exit_ip_changed", "old_ip": "60.149.136.130", "new_ip": "58.87.159.9",
- "reason": "实时丢包 5.3%，切到备用 (丢包 0.0%)", "node": "58.87.159.9 Sony Network Communications Inc UDP",
- "text": "出口 IP 变更 60.149.136.130 → 58.87.159.9，原因: ...", "time": 1791790423}
+{"event": "exit_ip_changed", "old_ip": "192.0.2.10", "new_ip": "198.51.100.20",
+ "reason": "实时丢包 5.3%，切到备用 (丢包 0.0%)", "node": "198.51.100.20 Example ISP UDP",
+ "text": "出口 IP 变更 192.0.2.10 → 198.51.100.20，原因: ...", "time": 1791790423}
 ```
 
 `event` 取值：`exit_ip_changed`、`no_node`（服务中断）、`recovered`（恢复，带新 IP）。发送是异步的，失败只记日志，不影响切换。
@@ -192,3 +215,7 @@ make release    # dist/ 下生成 linux amd64 / arm64 / armv7 / 386 静态二进
 GPL-3.0。本项目基于 [aimili-vpngate](https://github.com/OpenMili/aimili-vpngate)（GPL-3.0）用 Go 重写，并做了修改。
 
 请确认所在地法律和 VPS 服务商条款允许使用 VPN。VPNGate 是筑波大学的学术实验项目，节点由志愿者提供，请合理使用。
+
+## 发布内容与隐私
+
+仓库不包含部署环境文件、节点缓存、运行日志、Telegram 凭据或代理密码。`testdata/servers.csv` 仅包含文档网段的合成节点，无真实节点证书或私钥。安装时在目标机器生成随机凭据；`vpngate info` 显示的真实连接信息不要提交到仓库。
