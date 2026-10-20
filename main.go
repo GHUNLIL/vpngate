@@ -160,10 +160,13 @@ func run() error {
 
 	exits := make([]*SocksServer, cfg.Exits)
 	for i := range exits {
-		x := &SocksServer{Addr: net.JoinHostPort(cfg.ExitHost, strconv.Itoa(cfg.ExitPort+i)),
-			User:  cfg.ExitUser, Pass: cfg.ExitPass,
+		x := &SocksServer{
+			Addr:  net.JoinHostPort(cfg.ExitHost, strconv.Itoa(cfg.ExitPort+i)),
+			User:  cfg.ExitUser,
+			Pass:  cfg.ExitPass,
 			Allow: func(ip net.IP) bool { return sourceAllowed(cfg.ExitAllow, ip) },
-			Dial:  TunnelDialer(m.res, func() string { return m.ExitRoute(i) })}
+			Dial:  TunnelDialer(m.res, func() string { return m.ExitRoute(i) }),
+		}
 		if err := x.Listen(); err != nil {
 			return fmt.Errorf("出口 %d 监听失败: %w", i+1, err)
 		}
