@@ -158,7 +158,24 @@ func run() error {
 	defer ss.Close()
 	go ss.Serve()
 
-	web := NewWebUI(cfg, m, ss, ring)
+	exits := make([]*SocksServer, cfg.Exits)
+	for i := range exits {
+		x := &SocksServer{Addr: net.JoinHostPort(cfg.ExitHost, strconv.Itoa(cfg.ExitPort+i)),
+			User:  cfg.ExitUser, Pass: cfg.ExitPass,
+			Allow: func(ip net.IP) bool { return sourceAllowed(cfg.ExitAllow, ip) },
+			Dial:  TunnelDialer(m.res, func() string { return m.ExitRoute(i) })}
+		if err := x.Listen(); err != nil {
+			return fmt.Errorf("出口 %d 监听失败: %w", i+1, err)
+		}
+		defer x.Close()
+		go x.Serve()
+		exits[i] = x
+	}
+	if cfg.Exits > 0 {
+		log.Printf("出口池: %d 个 SOCKS5 出口，%s 端口 %d-%d", cfg.Exits, cfg.ExitHost, cfg.ExitPort, cfg.ExitPort+cfg.Exits-1)
+	}
+
+	web := NewWebUI(cfg, m, ss, exits, ring)
 	webAddr := net.JoinHostPort(cfg.WebHost, strconv.Itoa(cfg.WebPort))
 	errc := make(chan error, 1)
 	go func() { errc <- web.Serve(ctx, webAddr) }()
@@ -286,6 +303,18 @@ func info() error {
   服务状态  %s
 `, ip, env["WEB_PORT"], env["WEB_USER"], env["WEB_PASS"], SSURI(method, pass, ip, port, "VPNGATE"),
 		ip, port, method, pass, strings.TrimSpace(string(state)))
+	if n, _ := strconv.Atoi(env["EXITS"]); n > 0 {
+		first, _ := strconv.Atoi(env["EXIT_PORT"])
+		if first == 0 {
+			first = 10801
+		}
+		host := env["EXIT_HOST"]
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		fmt.Printf("  出口池 (每个端口一个固定出口 IP)  SOCKS5 %s 端口 %d-%d，账号 %s / %s\n\n",
+			host, first, first+n-1, env["EXIT_USER"], env["EXIT_PASS"])
+	}
 	return nil
 }
 

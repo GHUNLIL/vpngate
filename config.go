@@ -28,6 +28,15 @@ type Config struct {
 	SSAllow    []*net.IPNet // allowed client sources; empty = everyone
 	SSMaxConns int
 
+	// Exit pool: EXITS sticky tunnels, each with a fixed exit IP behind its own SOCKS5 port
+	Exits       int
+	ExitHost    string
+	ExitPort    int // first port; exit i listens on ExitPort+i
+	ExitUser    string
+	ExitPass    string
+	ExitAllow   []*net.IPNet // allowed client sources; empty = everyone
+	ExitMaxLoss float64      // replace an exit whose loss over the last ~30 s exceeds this (%)
+
 	Sources          []string
 	Transport        string // udp (native UDP only, TCP as last resort) | tcp | auto
 	Countries        []string
@@ -68,6 +77,12 @@ func LoadConfig() (*Config, error) {
 		SSPassword:       str("SS_PASSWORD", ""),
 		SSMethod:         str("SS_METHOD", "aes-128-gcm"),
 		SSMaxConns:       num("SS_MAX_CONNS", 8192, 16, 1<<20),
+		Exits:            num("EXITS", 0, 0, 16),
+		ExitHost:         str("EXIT_HOST", "127.0.0.1"),
+		ExitPort:         num("EXIT_PORT", 10801, 1, 65535),
+		ExitUser:         str("EXIT_USER", "vpngate"),
+		ExitPass:         str("EXIT_PASS", ""),
+		ExitMaxLoss:      float64(num("EXIT_MAX_LOSS", 20, 1, 100)),
 		Sources:          list("SOURCES", "https://www.vpngate.net/api/iphone/,http://www.vpngate.net/api/iphone/"),
 		Countries:        list("COUNTRIES", "JP"),
 		Transport:        strings.ToLower(str("TRANSPORT", "udp")),
@@ -100,6 +115,9 @@ func LoadConfig() (*Config, error) {
 	if c.WebAllow, err = cidrList("WEB_ALLOW"); err != nil {
 		return nil, err
 	}
+	if c.ExitAllow, err = cidrList("EXIT_ALLOW"); err != nil {
+		return nil, err
+	}
 	if c.WebPass == "" {
 		return nil, fmt.Errorf("WEB_PASS 未设置，拒绝以空密码启动管理后台")
 	}
@@ -108,6 +126,19 @@ func LoadConfig() (*Config, error) {
 	}
 	if c.WebPort == c.SSPort {
 		return nil, fmt.Errorf("WEB_PORT 与 SS_PORT 不能相同")
+	}
+	if c.Exits > 0 {
+		if c.ExitPass == "" {
+			return nil, fmt.Errorf("EXITS 已开启但 EXIT_PASS 未设置")
+		}
+		if c.ExitPort+c.Exits-1 > 65535 {
+			return nil, fmt.Errorf("EXIT_PORT + EXITS 超出端口范围")
+		}
+		for _, p := range []int{c.WebPort, c.SSPort} {
+			if p >= c.ExitPort && p < c.ExitPort+c.Exits {
+				return nil, fmt.Errorf("出口端口 %d-%d 与 WEB_PORT / SS_PORT 冲突", c.ExitPort, c.ExitPort+c.Exits-1)
+			}
+		}
 	}
 	if c.Transport != "udp" && c.Transport != "tcp" && c.Transport != "auto" {
 		return nil, fmt.Errorf("TRANSPORT 只能是 udp / tcp / auto")
