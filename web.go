@@ -25,6 +25,7 @@ type WebUI struct {
 	cfg     *Config
 	manager *Manager
 	ss      *SSServer
+	exits   []*SocksServer
 	logs    *LogRing
 
 	mu       sync.Mutex
@@ -36,8 +37,8 @@ type failure struct {
 	first time.Time
 }
 
-func NewWebUI(cfg *Config, m *Manager, ss *SSServer, logs *LogRing) *WebUI {
-	return &WebUI{cfg: cfg, manager: m, ss: ss, logs: logs, failures: map[string]failure{}}
+func NewWebUI(cfg *Config, m *Manager, ss *SSServer, exits []*SocksServer, logs *LogRing) *WebUI {
+	return &WebUI{cfg: cfg, manager: m, ss: ss, exits: exits, logs: logs, failures: map[string]failure{}}
 }
 
 func (w *WebUI) Handler() http.Handler {
@@ -159,6 +160,14 @@ func (w *WebUI) status() map[string]any {
 	s["version"] = version
 	s["ss"] = map[string]any{"port": w.cfg.SSPort, "method": w.cfg.SSMethod, "password": w.cfg.SSPassword,
 		"active": w.ss.Active.Load()}
+	if list, ok := s["exits"].([]map[string]any); ok {
+		for i, e := range list {
+			if i < len(w.exits) && w.exits[i] != nil {
+				e["active"] = w.exits[i].Active.Load()
+			}
+		}
+	}
+	s["exit_host"] = w.cfg.ExitHost
 	s["logs"] = w.logs.Lines()
 	return s
 }

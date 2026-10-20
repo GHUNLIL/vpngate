@@ -56,7 +56,8 @@ type Manager struct {
 	nodes       map[string]*Node
 	active      *Tunnel
 	standby     *Tunnel
-	lockedID    string // user-pinned node: keep this exit IP
+	exits       []*Tunnel // exit pool (EXITS): index i is served on EXIT_PORT+i
+	lockedID    string    // user-pinned node: keep this exit IP
 	closing     bool
 	exitIP      string // last announced exit IP, for change notifications
 	down        bool   // no usable node; announced once until recovery
@@ -78,6 +79,7 @@ func NewManager(cfg *Config) *Manager {
 	for i := 0; i < maxSlots; i++ {
 		m.slots = append(m.slots, i)
 	}
+	m.exits = make([]*Tunnel, cfg.Exits)
 	return m
 }
 
@@ -115,6 +117,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		ActiveSince int64    `json:"active_since"`
 		ExitIP      string   `json:"exit_ip"`
 		Used        []string `json:"used"`
+		Exits       []*Node  `json:"exits"`
 	}
 	if data, err := os.ReadFile(m.statePath()); err == nil {
 		_ = json.Unmarshal(data, &state)
@@ -139,6 +142,7 @@ func (m *Manager) Start(ctx context.Context) error {
 			m.mu.Unlock()
 		}
 	}
+	m.restoreExits(ctx, state.Exits)
 	return nil
 }
 
@@ -160,6 +164,7 @@ func (m *Manager) Run(ctx context.Context) {
 		}
 		m.selectMu.Lock()
 		m.ensure(ctx)
+		m.ensureExits(ctx)
 		m.selectMu.Unlock()
 
 		select {
@@ -175,7 +180,7 @@ func (m *Manager) Run(ctx context.Context) {
 func (m *Manager) nextWake() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.active == nil || !m.active.Alive() {
+	if m.active == nil || !m.active.Alive() || len(m.missingExits()) > 0 {
 		return time.Minute
 	}
 	wait := m.cfg.Refresh
@@ -192,7 +197,8 @@ func (m *Manager) nextWake() time.Duration {
 func (m *Manager) selectionDue() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.active == nil || !m.active.Alive() || m.cfg.Standby && (m.standby == nil || !m.standby.Alive()) {
+	if m.active == nil || !m.active.Alive() || m.cfg.Standby && (m.standby == nil || !m.standby.Alive()) ||
+		len(m.missingExits()) > 0 {
 		return true
 	}
 	if pinned := m.nodes[m.lockedID]; pinned != nil && m.active.Node != pinned {
@@ -229,6 +235,10 @@ func (m *Manager) SwitchTo(ctx context.Context, id string) error {
 	if n == nil {
 		m.mu.Unlock()
 		return fmt.Errorf("节点不存在")
+	}
+	if i := m.exitHolding(n); i >= 0 {
+		m.mu.Unlock()
+		return fmt.Errorf("该节点正被出口 %d 使用", i+1)
 	}
 	if m.active != nil && m.active.Node == n {
 		m.lockedID = id
@@ -274,13 +284,12 @@ func (m *Manager) SetLocked(locked bool) {
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
 	m.closing = true // from here on nothing is adopted or saved
-	tunnels := []*Tunnel{m.active, m.standby}
+	tunnels := m.tunnels()
 	m.active, m.standby = nil, nil
+	clear(m.exits)
 	m.mu.Unlock()
 	for _, t := range tunnels {
-		if t != nil {
-			t.Stop()
-		}
+		t.Stop()
 	}
 }
 
@@ -309,10 +318,8 @@ func (m *Manager) refresh(ctx context.Context) error {
 		}
 		merged[n.ID] = n
 	}
-	for _, t := range []*Tunnel{m.active, m.standby} { // in-use nodes may have dropped off the list
-		if t != nil {
-			merged[t.Node.ID] = t.Node
-		}
+	for _, t := range m.tunnels() { // in-use nodes may have dropped off the list
+		merged[t.Node.ID] = t.Node
 	}
 	if old := m.nodes[m.lockedID]; old != nil && merged[m.lockedID] == nil {
 		merged[m.lockedID] = old
@@ -388,8 +395,14 @@ func (m *Manager) transportOK(n *Node) bool {
 	return m.cfg.Transport == "auto" || n.Proto == m.cfg.Transport
 }
 
+// inUse reports whether n, or another node with the same IP, is already in service (caller holds m.mu).
 func (m *Manager) inUse(n *Node) bool {
-	return m.active != nil && m.active.Node == n || m.standby != nil && m.standby.Node == n
+	for _, t := range m.tunnels() {
+		if t.Node == n {
+			return true
+		}
+	}
+	return m.ipTaken(n, nil)
 }
 
 // isUsed reports whether rotation has already used this node's IP or exit IP (caller holds m.mu).
@@ -630,7 +643,7 @@ func (m *Manager) drain(t *Tunnel) {
 func (m *Manager) restoreLocked(ctx context.Context) {
 	m.mu.Lock()
 	n := m.nodes[m.lockedID]
-	if n == nil || m.active != nil && m.active.Node == n || n.Failed(time.Now()) {
+	if n == nil || m.active != nil && m.active.Node == n || n.Failed(time.Now()) || m.exitHolding(n) >= 0 {
 		m.mu.Unlock()
 		return
 	}
@@ -964,6 +977,11 @@ func (m *Manager) release(t *Tunnel) {
 	if m.standby == t {
 		m.standby = nil
 	}
+	for i, e := range m.exits {
+		if e == t {
+			m.exits[i] = nil
+		}
+	}
 	go func() {
 		t.Stop()
 		m.mu.Lock()
@@ -993,17 +1011,15 @@ func (m *Manager) monitor(ctx context.Context) {
 		case <-tick.C:
 		}
 		m.mu.RLock()
-		tunnels := []*Tunnel{m.active, m.standby}
+		tunnels := m.tunnels()
 		m.mu.RUnlock()
 		var wg sync.WaitGroup
 		for _, t := range tunnels {
-			if t != nil {
-				wg.Add(1)
-				go func(t *Tunnel) {
-					defer wg.Done()
-					m.observe(ctx, t)
-				}(t)
-			}
+			wg.Add(1)
+			go func(t *Tunnel) {
+				defer wg.Done()
+				m.observe(ctx, t)
+			}(t)
 		}
 		wg.Wait()
 		m.decide()
@@ -1012,7 +1028,7 @@ func (m *Manager) monitor(ctx context.Context) {
 		}
 		if i%mtuRecheck == 0 {
 			for _, t := range tunnels {
-				if t != nil && t.Alive() {
+				if t.Alive() {
 					m.recheckMTU(ctx, t)
 				}
 			}
@@ -1075,6 +1091,7 @@ func dead(loss []float64) bool {
 func (m *Manager) decide() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.checkExits()
 	a, s := m.active, m.standby
 	if a == nil {
 		return
@@ -1110,7 +1127,7 @@ func (m *Manager) housekeeping() {
 	m.mu.RLock()
 	pinned := m.nodes[m.lockedID]
 	need := pinned != nil && m.active != nil && m.active.Node != pinned && !pinned.Failed(time.Now()) ||
-		m.cfg.Standby && m.standby == nil
+		m.cfg.Standby && m.standby == nil || len(m.missingExits()) > 0
 	m.mu.RUnlock()
 	if need {
 		m.RequestRefresh()
@@ -1172,8 +1189,18 @@ func (m *Manager) Snapshot() map[string]any {
 			v.Role = "active"
 		case m.standby != nil && m.standby.Node == n:
 			v.Role = "standby"
+		default:
+			for i, t := range m.exits {
+				if t != nil && t.Node == n {
+					v.Role = fmt.Sprintf("exit%d", i+1)
+				}
+			}
 		}
 		list = append(list, v)
+	}
+	exits := make([]map[string]any, len(m.exits))
+	for i, t := range m.exits {
+		exits[i] = map[string]any{"index": i + 1, "port": m.cfg.ExitPort + i, "tunnel": view(t)}
 	}
 	var nextReselect int64
 	if m.active != nil && m.lockedID == "" {
@@ -1186,7 +1213,7 @@ func (m *Manager) Snapshot() map[string]any {
 		"rotate_no_repeat": m.cfg.NoRepeat, "used_count": len(m.used),
 		"last_refresh": m.lastRefresh,
 		"active":       view(m.active), "standby": view(m.standby),
-		"nodes": list,
+		"nodes": list, "exits": exits,
 	}
 }
 
@@ -1211,6 +1238,15 @@ func (m *Manager) saveState() {
 		state["last"] = m.active.Node
 		state["active_since"] = m.activeSince.Unix()
 		state["exit_ip"] = m.exitIP
+	}
+	if len(m.exits) > 0 {
+		exits := make([]*Node, len(m.exits))
+		for i, t := range m.exits {
+			if t != nil {
+				exits[i] = t.Node
+			}
+		}
+		state["exits"] = exits
 	}
 	data, err := json.Marshal(state)
 	if err != nil {

@@ -25,7 +25,7 @@ func newWeb(t *testing.T) (*WebUI, *Manager) {
 		"a": {ID: "a", IP: "1.2.3.4", Proto: "udp", Kind: "residential", RTT: ptr(20), Config: "secret"},
 		"b": {ID: "b", IP: "5.6.7.8", Proto: "tcp", Kind: "hosting"},
 	}
-	return NewWebUI(cfg, m, &SSServer{}, &LogRing{}), m
+	return NewWebUI(cfg, m, &SSServer{}, nil, &LogRing{}), m
 }
 
 func call(h http.Handler, method, path, user, pass string, csrf bool, body string) *httptest.ResponseRecorder {

@@ -39,6 +39,9 @@ pre{margin:0;max-height:260px;overflow:auto;font:12px/1.5 ui-monospace,Menlo,mon
   <div class="card"><h2>备用节点（热备，故障时秒切）</h2><div id="standby" class="muted">无</div></div>
   <div class="card"><h2>Shadowsocks（TCP + UDP）</h2><div id="ss"></div></div>
 </div>
+<div class="card table" id="exitsCard" style="margin-bottom:12px;display:none"><h2>出口池（SOCKS5，每个端口固定一个出口 IP，只在断线或网络差时更换）</h2>
+<table><thead><tr><th>出口</th><th>SOCKS5</th><th>出口 IP</th><th>运营商</th><th>城市</th><th>实时延迟</th><th>实时丢包</th><th>已连接</th><th>连接数</th></tr></thead>
+<tbody id="exits"></tbody></table></div>
 <div class="card table" style="margin-bottom:12px"><h2 id="ruleTitle">节点</h2>
 <table><thead><tr><th>IP</th><th>类型</th><th>运营商</th><th>城市</th><th>协议</th><th>直连</th><th>隧道延迟</th><th>抖动</th><th>丢包</th><th>速度</th><th>合格</th><th>状态</th><th></th></tr></thead>
 <tbody id="nodes"></tbody></table></div>
@@ -96,15 +99,25 @@ function render(s) {
   <span>Clash</span><code class="copy" title="点击复制">${esc(clash)}</code>
   <span>连接</span><span>${s.ss.active} 个 TCP 连接</span></div>
   <p class="sub">经专线中转时，把地址换成专线入口。</p>`;
+  const exits = s.exits || [];
+  $("exitsCard").style.display = exits.length ? "" : "none";
+  $("exits").innerHTML = exits.map(e => {
+    const n = e.tunnel;
+    const addr = `${esc(s.exit_host)}:${e.port}`;
+    if (!n) return `<tr><td>${e.index}</td><td>${addr}</td><td colspan="7" class="warn">正在分配节点…</td></tr>`;
+    const loss = n.live_loss ?? n.loss;
+    return `<tr><td>${e.index}</td><td>${addr}</td><td>${esc(n.exit_ip || n.ip)}</td><td>${esc(n.isp)}</td><td>${esc(n.city)}</td>
+    <td>${ms(n.live_rtt ?? n.rtt)}</td><td class="${lossCls(loss)}">${pct(loss)}</td><td>${since(n.since)}</td><td>${e.active ?? 0}</td></tr>`;
+  }).join("");
   $("nodes").innerHTML = s.nodes.map(n => {
-    const role = n.role === "active" ? '<span class="ok">● 使用中</span>' : n.role === "standby" ? '<span class="warn">● 备用</span>' : "";
+    const role = n.role === "active" ? '<span class="ok">● 使用中</span>' : n.role === "standby" ? '<span class="warn">● 备用</span>' : n.role?.startsWith("exit") ? `<span class="ok">● 出口 ${n.role.slice(4)}</span>` : "";
     const failed = n.failed_until * 1000 > Date.now();
     const st = role || (failed ? `<span class="bad">冷却中</span>` : n.rtt != null ? '<span class="muted">已测试</span>' : "");
     return `<tr class="${n.role === "active" ? "active" : ""}"><td>${esc(n.ip)}</td><td>${KIND[n.kind]||n.kind}</td>
     <td>${esc(n.isp)}</td><td>${esc(n.city)}</td><td>${n.proto.toUpperCase()}:${n.port}</td><td>${ms(n.direct_rtt)}</td>
     <td>${ms(n.rtt)}</td><td>${ms(n.jitter)}</td><td class="${lossCls(n.loss)}">${pct(n.loss)}</td><td>${mbps(n.mbps)}</td>
     <td>${n.rtt == null ? "–" : n.qualified ? '<span class="ok">✓</span>' : '<span class="muted">✗</span>'}</td><td>${st} <span class="err" title="${esc(n.error)}">${n.role ? "" : esc(n.error)}</span></td>
-    <td>${n.role === "active" ? "" : `<button data-id="${esc(n.id)}">切换</button>`}</td></tr>`;
+    <td>${n.role === "active" || n.role?.startsWith("exit") ? "" : `<button data-id="${esc(n.id)}">切换</button>`}</td></tr>`;
   }).join("");
   const logs = $("logs"), atBottom = logs.scrollTop + logs.clientHeight >= logs.scrollHeight - 4;
   logs.textContent = s.logs.join("\n");
